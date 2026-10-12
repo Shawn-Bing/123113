@@ -2522,39 +2522,96 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function historyViews(records,rules={}) {
     const signature=ruleSignature(rules),seen=new Set();return records.filter(record=>record&&typeof record.id==='string'&&!seen.has(record.id)&&seen.add(record.id)).map(record=>recordView(record,rules,signature)).filter(Boolean);
   }
-  function deriveWrong(records,stored={},rules={}) {
-    const result=Object.create(null),evidence=new Map();
-    const identity=(record,row,rowIndex)=>({recordId:record.id,rowIndex,sid:row.sid||record.sid,index:row.index,input:row.in,ts:record.ts});
-    for(const record of historyViews(records,rules)) {
-      if(!['normal','dictation','shuffle','wrong'].includes(record.mode))continue;
-      record.rows.forEach((row,rowIndex)=>{
-        if(typeof row.w!=='string')return;
-        if(!evidence.has(row.w))evidence.set(row.w,[]);
-        evidence.get(row.w).push({...identity(record,row,rowIndex),correct:row.correct});
-        if(row.correct!==false)return;
-        const previous=result[row.w],saved=Object.hasOwn(stored,row.w)?stored[row.w]:{},n=(previous?.n||0)+1;
-        result[row.w]={...saved,sid:row.sid||record.sid,index:row.index,in:row.in,n,ts:record.ts,mastered:!!saved.mastered,pending:false,provenance:{historyErrors:n,legacy:'none'}};
-      });
-    }
-    for(const [word,saved]of Object.entries(stored)) {
-      const current=result[word],rows=evidence.get(word)||[];
-      if(saved.manual&&!current){result[word]={...saved,n:0,manual:true,pending:false,provenance:{historyErrors:0,legacy:'manual'}};continue;}
-      if(typeof saved.in!=='string'||!normalize(saved.in)) {
-        if(current){current.legacyEvidence={...saved,state:'missing-input'};current.legacyCount=saved.n;}
-        else result[word]={...saved,n:0,pending:true,legacyCount:saved.n,provenance:{historyErrors:0,legacy:'missing-input'}};
-        continue;
+  const cloneEvidence=value=>JSON.parse(JSON.stringify(value));
+  const stableValue=value=>Array.isArray(value)?value.map(stableValue):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,stableValue(value[key])])):value;
+  const stableJSON=value=>JSON.stringify(stableValue(value));
+  const referenceId=(recordId,rowIndex)=>JSON.stringify([recordId,rowIndex]);
+  function validWrongEntry(value) {
+    if(!value||typeof value!=='object'||Array.isArray(value))return false;
+    if(value.evidenceVersion!==1)return typeof value.sid==='string'&&Number.isFinite(value.n);
+    const map=v=>v&&typeof v==='object'&&!Array.isArray(v),master=value.mastery;
+    return map(value.legacySnapshots)&&map(value.historyRefs)&&map(value.manualSources)&&master&&typeof master.value==='boolean'&&(master.changedAt===null||Number.isFinite(master.changedAt))&&typeof master.actionId==='string'&&
+      Object.values(value.legacySnapshots).every(v=>map(v)&&typeof v.word==='string'&&typeof v.sid==='string'&&typeof v.hasInput==='boolean'&&(!v.hasInput||typeof v.in==='string')&&(v.n===undefined||Number.isFinite(v.n)))&&
+      Object.values(value.historyRefs).every(v=>map(v)&&typeof v.recordId==='string'&&Number.isInteger(v.rowIndex)&&v.rowIndex>=0)&&
+      Object.values(value.manualSources).every(v=>map(v)&&typeof v.sid==='string'&&typeof v.word==='string'&&Number.isInteger(v.index)&&v.index>=0);
+  }
+  function evidenceEntry(word,saved={}) {
+    const entry=cloneEvidence(saved);if(entry.evidenceVersion===1){if(!validWrongEntry(entry))throw Error('invalid evidence entry');return entry;}
+    const snapshot={word,sid:saved.sid,index:saved.index,ts:saved.ts,n:saved.n,hasInput:Object.hasOwn(saved,'in')};
+    if(snapshot.hasInput)snapshot.in=saved.in;if(saved.evidence)snapshot.evidence=cloneEvidence(saved.evidence);
+    entry.sid=typeof saved.sid==='string'?saved.sid:'';entry.n=Number.isFinite(saved.n)?saved.n:0;entry.evidenceVersion=1;entry.legacySnapshots={};entry.historyRefs={};entry.manualSources={};
+    if(saved.manual){const source={sid:saved.sid,index:saved.index,word};entry.manualSources[stableJSON(source)]=source;}
+    else if(Object.keys(saved).length)entry.legacySnapshots[stableJSON(snapshot)]=snapshot;
+    if(saved.evidence)entry.historyRefs[referenceId(saved.evidence.recordId,saved.evidence.rowIndex)]=cloneEvidence(saved.evidence);
+    entry.mastery={value:!!saved.mastered,changedAt:null,actionId:'legacy'};return entry;
+  }
+  function mergeEvidence(word,local={},incoming={}) {
+    const a=evidenceEntry(word,local),b=evidenceEntry(word,incoming),result={...(Object.keys(local).length?a:b)};
+    for(const field of ['legacySnapshots','historyRefs','manualSources']){
+      result[field]={...a[field]};for(const [id,value]of Object.entries(b[field]||{})){
+        if(Object.hasOwn(result[field],id)&&stableJSON(result[field][id])!==stableJSON(value))throw Error('conflicting evidence '+id);
+        Object.defineProperty(result[field],id,{value:cloneEvidence(value),enumerable:true,writable:true,configurable:true});
       }
-      // Rejudge the saved literal first: accepted format mistakes never return to review.
-      if(scoreGrade(saved.in,word,{ignoreCase:true,looseRules:true},rules).correct)continue;
-      const explicit=saved.evidence;
-      const matches=rows.filter(row=>row.input===saved.in&&row.sid===saved.sid&&
-        (explicit?row.recordId===explicit.recordId&&row.rowIndex===explicit.rowIndex:
-          Number.isFinite(saved.ts)&&row.ts===saved.ts&&Number.isInteger(saved.index)&&row.index===saved.index));
-      if(matches.length===1){if(current)current.provenance.legacy='matched';continue;}
-      if(current){
-        // The old last error may be one of the complete rows. Keep it visible, never double-count a guess.
-        current.legacyEvidence={...saved,state:'unresolved-link'};current.legacyCount=saved.n;current.provenance.legacy='unresolved-link';
-      }else result[word]={...saved,n:1,pending:false,legacyCount:saved.n,legacyPending:Math.max(0,saved.n-1),provenance:{historyErrors:0,legacy:'independent'},legacyEvidence:{...saved,state:'independent'}};
+    }
+    const event=value=>[Number.isFinite(value?.changedAt)?value.changedAt:-Infinity,value?.actionId||''];
+    if((b.ts||0)>(a.ts||0))for(const field of ['sid','index','in','n','ts','manual','evidence'])if(Object.hasOwn(b,field))result[field]=cloneEvidence(b[field]);
+    const av=event(a.mastery),bv=event(b.mastery);if(bv[0]>av[0]||bv[0]===av[0]&&bv[0]!==-Infinity&&bv[1]>av[1])result.mastery=cloneEvidence(b.mastery);
+    // Old backups contain error timestamps, not timestamps of a user's mastery action.
+    if(!Object.keys(local).length)result.mastery=cloneEvidence(b.mastery);
+    result.mastered=!!result.mastery?.value;return result;
+  }
+  function setMastery(entry,value,now=Date.now(),actionId='master:'+now) {
+    entry.mastery={value:!!value,changedAt:Math.max(now,(entry.mastery?.changedAt||0)+1),actionId};entry.mastered=!!value;return entry;
+  }
+  function mutateWrong(stored,operation) {
+    const result={...stored},put=(word,entry)=>Object.defineProperty(result,word,{value:entry,enumerable:true,writable:true,configurable:true});
+    if(operation.type==='merge')for(const [word,saved]of Object.entries(operation.wrong||{}))put(word,mergeEvidence(word,Object.hasOwn(result,word)?result[word]:{},saved));
+    if(operation.type==='record')operation.record.rows.forEach((row,rowIndex)=>{
+      if(row.correct!==false)return;const entry=evidenceEntry(row.w,Object.hasOwn(result,row.w)?result[row.w]:{}),id=referenceId(operation.record.id,rowIndex);
+      if(Object.hasOwn(entry.historyRefs,id))return;
+      entry.historyRefs[id]={recordId:operation.record.id,rowIndex};entry.sid=row.sid||operation.record.sid;entry.index=row.index;entry.in=row.in;entry.ts=operation.record.ts;
+      // n remains a compatibility field; current counts are derived from refs/raw rows, never old n.
+      entry.n=Object.keys(entry.historyRefs).length;setMastery(entry,false,operation.now,'error:'+id);put(row.w,entry);
+    });
+    if(operation.type==='master'){const entry=evidenceEntry(operation.word,Object.hasOwn(result,operation.word)?result[operation.word]:{});setMastery(entry,operation.value,operation.now,operation.actionId);put(operation.word,entry);}
+    if(operation.type==='manual')for(const item of operation.items){const entry=evidenceEntry(item.w,Object.hasOwn(result,item.w)?result[item.w]:{}),source={sid:item.sid,index:item.index,word:item.w},id=stableJSON(source);entry.manualSources[id]=source;entry.sid=item.sid;entry.index=item.index;entry.manual=true;entry.n=entry.n||0;setMastery(entry,false,operation.now,operation.actionId);put(item.w,entry);}
+    return result;
+  }
+  function mergeRecords(local,incoming) {
+    const result=local.slice(),known=new Map(local.map(record=>[record.id,record]));for(const record of incoming){
+      if(known.has(record.id)){if(stableJSON(known.get(record.id))!==stableJSON(record))throw Error('record-id-conflict: '+record.id);continue;}
+      known.set(record.id,record);result.push(record);
+    }return result;
+  }
+  function deriveWrong(records,stored={},rules={}) {
+    const history=historyViews(records,rules),words=new Set(Object.keys(stored)),byWord=new Map(),result=Object.create(null);
+    for(const record of history)if(['normal','dictation','shuffle','wrong'].includes(record.mode))record.rows.forEach((row,rowIndex)=>{
+      if(typeof row.w!=='string')return;words.add(row.w);if(!byWord.has(row.w))byWord.set(row.w,[]);byWord.get(row.w).push({recordId:record.id,rowIndex,sid:row.sid||record.sid,index:row.index,input:row.in,ts:record.ts,correct:row.correct,occurrenceId:referenceId(record.id,rowIndex)});
+    });
+    for(const word of words){
+      const saved=Object.hasOwn(stored,word)?stored[word]:{},entry=evidenceEntry(word,saved),rows=byWord.get(word)||[],errors=rows.filter(v=>v.correct===false),sources=new Map(),legacy=[],unresolved=[];let legacyCount=0,missing=false;
+      const sourceFor=value=>{const id=stableJSON([value.sid,value.index,word]);if(!sources.has(id))sources.set(id,{sid:value.sid,index:value.index,w:word,n:0,occurrences:[],pending:false,manual:false});return sources.get(id);};
+      for(const row of errors){const source=sourceFor(row);source.n++;source.occurrences.push({...row,type:'history'});}
+      let matched=false;
+      for(const [id,snapshot]of Object.entries(entry.legacySnapshots||{})){
+        legacyCount=Math.max(legacyCount,Number.isFinite(snapshot.n)?snapshot.n:0);const source=sourceFor(snapshot);
+        if(!snapshot.hasInput||typeof snapshot.in!=='string'){missing=true;source.pending=true;unresolved.push({...snapshot,id,state:'missing-input'});continue;}
+        if(scoreGrade(snapshot.in,word,{ignoreCase:true,looseRules:true},rules).correct)continue;
+        const matches=rows.filter(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.evidence?row.recordId===snapshot.evidence.recordId&&row.rowIndex===snapshot.evidence.rowIndex:Number.isFinite(snapshot.ts)&&row.ts===snapshot.ts&&Number.isInteger(snapshot.index)&&row.index===snapshot.index));
+        if(matches.length===1){matched=true;continue;}
+        const possible=errors.some(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.index===undefined||row.index===snapshot.index));
+        const value={...snapshot,id,state:possible?'unresolved-link':'independent'};source.occurrences.push({...value,input:snapshot.in,occurrenceId:'legacy:'+id,type:'legacy'});
+        (possible?unresolved:legacy).push(value);
+      }
+      // Unknown legacy cumulative declarations never add up to invented historical events.
+      // At most one independently evidenced old error contributes beyond complete raw rows.
+      if(legacy.length){const snapshot=legacy.slice().sort((a,b)=>(b.ts||0)-(a.ts||0)||a.id.localeCompare(b.id))[0];sourceFor(snapshot).n++;}
+      for(const source of Object.values(entry.manualSources||{})){const item=sourceFor(source);item.manual=true;}
+      const n=errors.length+(legacy.length?1:0),manual=[...sources.values()].some(v=>v.manual),pending=!n&&!manual&&missing;
+      if(!n&&!manual&&!pending&&!unresolved.length)continue;
+      const latest=errors.slice().sort((a,b)=>a.ts-b.ts).at(-1)||legacy[0]||unresolved[0]||{},mastered=!!entry.mastery?.value;
+      result[word]={...saved,sid:latest.sid||saved.sid,index:latest.index??saved.index,in:latest.input??latest.in??saved.in,ts:latest.ts??saved.ts,n,mastered,manual,pending:pending||!n&&!manual,legacyCount:legacyCount||undefined,legacyPending:Math.max(0,legacyCount-1),sources:[...sources.values()].filter(v=>v.n||v.manual||v.pending||v.occurrences.length),provenance:{historyErrors:errors.length,legacy:unresolved.some(v=>v.state==='unresolved-link')?'unresolved-link':legacy.length?'independent':missing?'missing-input':matched?'matched':manual?'manual':'none'}};
+      const extra=unresolved[0]||legacy[0];if(extra)result[word].legacyEvidence=extra;
     }
     return result;
   }
@@ -2672,7 +2729,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return { total: data.words[sid]?.length || 0, practiced: practiced.size,
       attempts: history.length, last: history.at(-1) || null, drafts: saved };
   }
-  return { sourceRecord,originalImmediate,ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
+  return { validWrongEntry,evidenceEntry,mergeEvidence,mutateWrong,mergeRecords,referenceId,stableJSON,sourceRecord,originalImmediate,ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
 });
 
 </script>
@@ -2723,21 +2780,27 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function mistakes(input,answer,settings,rules={}){return occurrencesForRow(input,answer,settings,rules).filter(v=>['incorrect','omission'].includes(v.verdict)).map(v=>({word:keyFor(v.word,rules),input:v.input}));}
   function profiles(records,rules={}){
-    const words=new Map(),seen=new Set(),parsed=new Map();
+    const words=new Map(),seen=new Set(),parsed=new Map(),unattributedPending=[];
     for(const record of records){
       if(!record||!modes.has(record.mode)||!Array.isArray(record.rows)||typeof record.id!=='string'||seen.has(record.id))continue;seen.add(record.id);
       const settings={ignoreCase:record.ignoreCase!==false,looseRules:true};
       record.rows.forEach((row,rowIndex)=>{
-        if(!row||typeof row.w!=='string'||typeof row.in!=='string')return;
-        const signature=JSON.stringify([row.w,row.in,settings.ignoreCase]);if(!parsed.has(signature))parsed.set(signature,occurrencesForRow(row.in,row.w,settings,rules));
+        if(!row||typeof row.w!=='string'){unattributedPending.push({recordId:record.id,rowIndex,sid:row?.sid||record.sid,reason:'missing-answer'});return;}
+        const signature=JSON.stringify([row.w,row.in,settings.ignoreCase]);if(!parsed.has(signature)){
+          if(typeof row.in==='string')parsed.set(signature,occurrencesForRow(row.in,row.w,settings,rules));
+          else {const forms=C.answerForms(row.w).map(tokens),first=forms[0]||[],identical=forms.every(form=>form.length===first.length&&form.every((word,i)=>keyFor(word,rules)===keyFor(first[i],rules)));
+            parsed.set(signature,identical?first.map(word=>({word,input:null,verdict:'pending',reason:'missing-input'})):[]);
+          }
+        }
+        if(!parsed.get(signature).length){unattributedPending.push({recordId:record.id,rowIndex,sid:row.sid||record.sid,context:row.w,reason:'optional-answer-identity'});return;}
         const phrase=tokens(C.answerForms(row.w)[0]).length>1;
         parsed.get(signature).forEach((value,tokenIndex)=>{
           const word=keyFor(value.word,rules);if(!word)return;if(!words.has(word))words.set(word,[]);
-          words.get(word).push({id:record.id+':'+rowIndex+':'+tokenIndex,recordId:record.id,word,expected:value.word,input:value.input,verdict:value.verdict,reason:value.reason,sid:row.sid||record.sid,index:row.index,context:row.w,rawInput:row.in,sourceType:phrase?'phrase':'standalone',ts:record.ts||0,day:dayKey(record.ts||0),rowIndex,tokenIndex});
+          words.get(word).push({id:record.id+':'+rowIndex+':'+tokenIndex,recordId:record.id,word,expected:value.word,input:value.input,verdict:value.verdict,reason:value.reason,sid:row.sid||record.sid,index:row.index,context:row.w,rawInput:typeof row.in==='string'?row.in:null,sourceType:phrase?'phrase':'standalone',ts:record.ts||0,day:dayKey(record.ts||0),rowIndex,tokenIndex});
         });
       });
     }
-    return [...words].map(([word,occurrences])=>summarize(word,occurrences)).sort(rank);
+    const result=[...words].map(([word,occurrences])=>summarize(word,occurrences)).sort(rank);Object.defineProperty(result,'unattributedPending',{value:unattributedPending});return result;
   }
   function summarize(word,occurrences){
     occurrences=occurrences.slice().sort((a,b)=>a.ts-b.ts||a.recordId.localeCompare(b.recordId)||a.rowIndex-b.rowIndex||a.tokenIndex-b.tokenIndex);
@@ -2898,11 +2961,12 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return { vocabularyTypes: mergedTypes, audioCorrections: mergedCorrections };
   }
   function retryItems(data, entries) {
-    return entries.map(([word, info]) => {
-      const words = data.words[info.sid] || [];
-      const index = Number.isInteger(info.index) && (words[info.index]?.w === word || words[info.index]?.previousWords?.includes(word)) ? info.index : words.findIndex(item => item.w === word);
-      return index < 0 ? null : { ...words[index], sid: info.sid, index };
-    }).filter(Boolean);
+    const seen=new Set(),items=[];
+    for(const [word,info]of entries)for(const source of info.sources?.length?info.sources:[info]){
+      if(source.pending&&!source.n&&!source.manual)continue;
+      const words=data.words[source.sid]||[],index=Number.isInteger(source.index)&&(words[source.index]?.w===word||words[source.index]?.previousWords?.includes(word))?source.index:words.findIndex(item=>item.w===word),id=JSON.stringify([source.sid,index]);
+      if(index<0||seen.has(id))continue;seen.add(id);items.push({...words[index],sid:source.sid,index,sourceOccurrences:source.occurrences||[]});
+    }return items;
   }
   function paperQueue(items, options = {}, random = Math.random) {
     const seen = new Set();
@@ -3069,6 +3133,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   keys.drafts = key('dict3_saved_drafts');
   keys.feedbackDraft = key('dict3_feedback_draft');
   keys.paper = key('dict3_paper_draft');
+  keys.pendingWrite = key('dict3_evidence_pending');
   const read = (name, fallback) => { try { return JSON.parse(localStorage.getItem(keys[name])) ?? fallback; } catch { return fallback; } };
   function save(name, value) { try { localStorage.setItem(keys[name], JSON.stringify(value)); return true; } catch { toast('浏览器存储空间不足，请先导出备份。'); return false; } }
   const defaults = { profileVersion: 2, preset: '强化', rate: 1.4, interval: 5, repeat: 1, submit: 'manual', ignoreCase: true, showFeedback: true, showCorrectAnswer: false, autoNext: false, looseRules: true, showSrc: false, showMean: false, immerse: false };
@@ -3311,9 +3376,10 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function paperReviewItems(entries){
     entries=entries.filter(([,v])=>!v.pending);if(paperOptions.dedupe)return F.retryItems(D,entries);
-    const selected=new Set(entries.map(([word])=>word)),covered=new Set(),items=[];
-    for(const record of currentRecords())record.rows.forEach((row,rowIndex)=>{if(row.correct!==false||!selected.has(row.w))return;const item=C.itemForRow(D,row,record.sid);if(item){covered.add(row.w);items.push({...item,recordId:record.id,rowIndex,occurrenceId:JSON.stringify([record.id,rowIndex])});}});
-    return items.concat(F.retryItems(D,entries.filter(([word])=>!covered.has(word))));
+    const items=[],seen=new Set();for(const [word,entry]of entries)for(const source of entry.sources||[]){
+      const occurrences=source.occurrences?.length?source.occurrences:[{occurrenceId:'source:'+C.stableJSON([source.sid,source.index,word]),...source}];
+      for(const occurrence of occurrences){if(occurrence.type==='legacy'&&occurrence.state==='unresolved-link')continue;const id=occurrence.occurrenceId;if(seen.has(id))continue;const item=C.itemForRow(D,{w:word,sid:source.sid,index:source.index},source.sid);if(item){seen.add(id);items.push({...item,recordId:occurrence.recordId,rowIndex:occurrence.rowIndex,occurrenceId:id});}}
+    }return items;
   }
   function startPaper(resume=false) {
     let state=resume?read('paper',null):null;
@@ -3339,13 +3405,14 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     save('paper',paper.state);$('#paper-stage').innerHTML=paperStage(paper.state);
   }
   function wrongBannerTitle(){const count=wrongFilter==='frequency'?filteredFrequency().length:filteredWrong().length;return wrongFilter==='uncertain'?`${count} 条旧记录待确认。`:wrongFilter==='mastered'?`${count} 个词条保留已掌握标记。`:wrongFilter==='frequency'?`找到 ${count} 个高频错词，按错误次数逐个巩固。`:count?`还有 ${count} 个单词，值得再练一次。`:'今天，从熟悉一个新单词开始。';}
-  function wrongEntries(group=wrongFilter){return Object.entries(currentWrong()).filter(([word,w])=>(group==='uncertain'?w.pending:group==='mastered'?w.mastered&&!w.pending:!w.mastered&&!w.pending)&&(wrongChapter==='all'||w.sid===wrongChapter)&&C.fold(word).includes(C.fold(wrongSearch))).sort((a,b)=>b[1].n-a[1].n);}
+  function wrongEntries(group=wrongFilter){return Object.entries(currentWrong()).map(([word,value])=>{if(wrongChapter==='all')return [word,value];const sources=(value.sources||[]).filter(source=>source.sid===wrongChapter);if(!sources.length)return [word,null];const first=sources.find(source=>source.n)||sources[0];return [word,{...value,sources,sid:first.sid,index:first.index,n:sources.reduce((n,source)=>n+source.n,0)}];}).filter(([,value])=>value).filter(([word,w])=>(group==='uncertain'?w.pending:group==='mastered'?w.mastered&&!w.pending:!w.mastered&&!w.pending)&&C.fold(word).includes(C.fold(wrongSearch))).sort((a,b)=>b[1].n-a[1].n);}
   function filteredWrong(){return wrongEntries();}
   function showWrongEvidence(word){
     const entry=currentWrong()[word],saved=wrong[word];if(!entry)return;
     const rows=records.flatMap(record=>(record.rows||[]).flatMap((row,index)=>row?.w===word?[{record,row,index}]:[]));
+    const snapshots=Object.values(C.evidenceEntry(word,saved||{}).legacySnapshots||{}),snapshotTable=snapshots.length?'<h3>不可变旧证据</h3><table><thead><tr><th>原章节 / 序号</th><th>原始输入</th><th>旧累计声明（未核实）</th></tr></thead><tbody>'+snapshots.map(value=>'<tr><td>'+esc(value.sid)+' / '+(Number.isInteger(value.index)?value.index+1:'—')+'</td><td>'+esc(value.hasInput?value.in:'缺少原始输入')+'</td><td>'+esc(value.n??'—')+'</td></tr>').join('')+'</tbody></table>':'';
     const body='<p class="notice">确定错误只计可靠答卷证据。独立旧错保留最后原始输入的一次证据；旧累计不代表已核实次数。无法确定是否与完整答卷重复的旧证据单列待核实，不叠加确定次数。缺原始输入的条目仍在待确认分组，掌握标记不改变证据状态。</p><dl><dt>保存的旧输入</dt><dd>'+esc(typeof saved?.in==='string'?saved.in||'空白':'缺少原始输入')+'</dd><dt>旧累计次数</dt><dd>'+esc(saved?.n??'—')+'</dd><dt>当前确定错误</dt><dd>'+entry.n+'</dd><dt>掌握标记</dt><dd>'+(entry.mastered?'已掌握（保留）':'未掌握')+'</dd></dl>'+ (rows.length?'<table><thead><tr><th>原记录 / 题号</th><th>原始输入</th><th>答卷</th></tr></thead><tbody>'+rows.map(({record,row,index})=>'<tr><td>'+esc(record.id)+' / '+(index+1)+'</td><td>'+esc(typeof row.in==='string'?row.in:'缺少原始输入')+'</td><td>'+button('查看原答卷','record','data-id="'+esc(record.id)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table>':'<p>未找到可证明对应的完整答卷；旧输入和原错本仍保存在 JSON 备份。</p>');
-    modal('原始证据 · '+esc(word),entry.pending?'待确认，不加入普通复习或 TXT':entry.legacyEvidence?'包含独立或待核实的旧错证据':'已定位完整答卷证据',body,true);
+    modal('原始证据 · '+esc(word),entry.pending?'待确认，不加入普通复习或 TXT':entry.legacyEvidence?'包含独立或待核实的旧错证据':'已定位完整答卷证据',body+snapshotTable,true);
   }
   function wrongTable() {
     if (wrongFilter === 'frequency') return frequencyTable();
@@ -3353,7 +3420,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if (!list.length) return `<div class="panel">${empty('这里还没有错词', pending().length ? '换一个章节或搜索词看看。' : '完成一次听写后，错词会出现在这里。也可以导入项目已有的错词记录。', button('去练习', 'route', 'data-route="library"', 'primary') + ' ' + button('导入已有错词', 'legacy'))}</div>`;
     return `<div class="panel table-wrap"><table><thead><tr><th>单词 / 释义</th><th>最近输入</th><th>错误次数</th><th>来自章节</th><th>操作</th></tr></thead><tbody>${list.map(([word, w]) => {
       const item = F.retryItems(D, [[word, w]])[0];
-      return `<tr><td><strong class="english">${esc(word)}</strong><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="red">${esc(typeof w.in==='string'?w.in||'未作答':'原始输入缺失')}</td><td>${w.pending?'待确认':w.manual&&!w.n?'手动标记':w.n+' 次'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':'')+(w.legacyEvidence?.state==='unresolved-link'?' · 旧错证据待核实':'')}</td><td>${esc(w.sid)}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}">${w.pending?(w.mastered?'取消掌握标记（仍待确认）':'标记掌握（仍待确认）'):w.mastered?'移回待复习':'标记掌握'}</button><button class="text-btn" data-act="wrong-evidence" data-word="${esc(word)}">查看证据</button></div></td></tr>`;
+      return `<tr><td><strong class="english">${esc(word)}</strong><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="red">${esc(typeof w.in==='string'?w.in||'未作答':'原始输入缺失')}</td><td>${w.pending?'待确认':w.manual&&!w.n?'手动标记':w.n+' 次'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':'')+(w.legacyEvidence?.state==='unresolved-link'?' · 旧错证据待核实':'')}</td><td>${esc(w.sid)}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${item?.sid || w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}">${w.pending?(w.mastered?'取消掌握标记（仍待确认）':'标记掌握（仍待确认）'):w.mastered?'移回待复习':'标记掌握'}</button><button class="text-btn" data-act="wrong-evidence" data-word="${esc(word)}">查看证据</button></div></td></tr>`;
     }).join('')}</tbody></table></div>`;
   }
   function frequencyStats() {
@@ -3376,14 +3443,14 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function profileTable(resultOnly=false){
     let list=W.filter(allProfiles(),resultOnly?'all':wrongChapter,resultOnly?'':wrongSearch);
     if(resultOnly){const relevant=new Set(result.rows.flatMap(row=>W.tokens(C.answerForms(row.w)[0]).map(word=>C.canonicalSpelling(word,RULES,true))));list=list.filter(e=>relevant.has(e.word));}
-    const pending=list.reduce((n,e)=>n+e.pending,0),valid=list.reduce((n,e)=>n+e.total,0);
-    return '<div class="section-top"><h2>全历史单词档案</h2><span class="muted">'+list.length+' 词 · 有效出现 '+valid+' · 待确认 '+pending+'</span></div><p class="notice">标准单词合并独立词与词组的全部出现；同一轮重复逐次计入。待确认不进入正确率。长期状态需跨日期证据；少量样本仅提供独立短期观察。同日反复答对仍可能数据不足。历史原答卷与判分保留。</p><div class="panel table-wrap"><table><thead><tr><th>标准词</th><th>正确次数 / 有效出现</th><th>主要错拼</th><th>长期状态 / 本轮与历史观察</th><th>详情</th></tr></thead><tbody>'+list.slice(0,profileLimit).map(e=>'<tr><td><strong class="english">'+esc(e.expected)+'</strong></td><td>'+e.correct+' / '+e.total+' · '+(e.accuracy===null?'—':e.accuracy+'%')+'</td><td>'+esc(e.typos[0]?.input||(e.n?'漏写':'—'))+(e.typos[0]?' × '+e.typos[0].n:'')+'</td><td>'+e.status+'<small class="frequency-breakdown">'+esc(e.observations.slice(0,2).map(v=>v.label).join('；')||'暂无短期观察')+'</small><small class="frequency-breakdown">覆盖 '+e.coverage+'% · 待确认 '+e.pending+'</small></td><td>'+button('查看来源','word-profile','data-word="'+esc(e.word)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>'+(list.length>profileLimit?button('显示更多档案','profiles-more'):'');
+    const pending=list.reduce((n,e)=>n+e.pending,0),valid=list.reduce((n,e)=>n+e.total,0),unattributed=(allProfiles().unattributedPending||[]).filter(v=>resultOnly?v.recordId===result.id:wrongChapter==='all'||v.sid===wrongChapter).length;
+    return '<div class="section-top"><h2>全历史单词档案</h2><span class="muted">'+list.length+' 词 · 有效出现 '+valid+' · 待确认 '+pending+(unattributed?' · 行级未归属待确认 '+unattributed:'')+'</span></div><p class="notice">标准单词合并独立词与词组的全部出现；同一轮重复逐次计入。待确认不进入正确率。长期状态需跨日期证据；少量样本仅提供独立短期观察。同日反复答对仍可能数据不足。历史原答卷与判分保留。</p><div class="panel table-wrap"><table><thead><tr><th>标准词</th><th>正确次数 / 有效出现</th><th>主要错拼</th><th>长期状态 / 本轮与历史观察</th><th>详情</th></tr></thead><tbody>'+list.slice(0,profileLimit).map(e=>'<tr><td><strong class="english">'+esc(e.expected)+'</strong></td><td>'+e.correct+' / '+e.total+' · '+(e.accuracy===null?'—':e.accuracy+'%')+'</td><td>'+esc(e.typos[0]?.input||(e.n?'漏写':'—'))+(e.typos[0]?' × '+e.typos[0].n:'')+'</td><td>'+e.status+'<small class="frequency-breakdown">'+esc(e.observations.slice(0,2).map(v=>v.label).join('；')||'暂无短期观察')+'</small><small class="frequency-breakdown">覆盖 '+e.coverage+'% · 待确认 '+e.pending+'</small></td><td>'+button('查看来源','word-profile','data-word="'+esc(e.word)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>'+(list.length>profileLimit?button('显示更多档案','profiles-more'):'');
   }
   function showWordProfile(word){
     const e=allProfiles().find(e=>e.word===word);if(!e)return;
     const last=v=>v?new Date(v.ts).toLocaleDateString('zh-CN')+' · '+v.context:'—';
     modal('单词档案 · '+esc(e.expected),'按 '+C.ANALYSIS_VERSION+' 分析 · 原答卷保留',
-      '<p>有效出现 '+e.total+' · 正确 '+e.correct+' · 错误 '+e.n+' · 正确率 '+(e.accuracy===null?'—':e.accuracy+'%')+' · 待确认 '+e.pending+' · 覆盖 '+e.coverage+'%</p><p>单独单词 '+e.standaloneStats.correct+' / '+e.standaloneStats.total+' · 词组内部 '+e.phraseStats.correct+' / '+e.phraseStats.total+' · 长期状态：'+e.status+'</p><p>短期观察（不代表长期结论）：'+esc(e.observations.map(v=>v.label).join('；')||'暂无')+'</p><p>最近正确：'+esc(last(e.lastCorrect))+'<br>最近错误：'+esc(last(e.lastIncorrect))+'</p><p>错误写法：'+(e.typos.map(v=>esc(v.input||'漏写')+' × '+v.n).join('；')||'—')+'</p><p class="notice">基本掌握需至少8次有效记录、3个日期、跨度7天且最近6次跨2日期全对；固化/不稳定需至少6次有效记录与3个日期。固化还需同错拼至少3次跨2日、最近仍错。</p><div class="table-wrap"><table><thead><tr><th>日期 / 原题</th><th>原始输入</th><th>词级输入 / 判定</th><th>来源</th></tr></thead><tbody>'+e.occurrences.map(v=>'<tr><td>'+esc(v.day)+'<br>'+esc(v.context)+'</td><td>'+esc(v.rawInput||'未作答')+'</td><td>'+esc(v.input||'—')+'<br>'+({correct:'正确',incorrect:'错误',omission:'漏写',pending:'待确认'}[v.verdict])+' · '+esc(v.reason)+'</td><td>'+esc(v.sid)+' #'+(Number.isInteger(v.index)?v.index+1:'—')+'<br>'+button('原答卷','record','data-id="'+esc(v.recordId)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>',true);
+      '<p>有效出现 '+e.total+' · 正确 '+e.correct+' · 错误 '+e.n+' · 正确率 '+(e.accuracy===null?'—':e.accuracy+'%')+' · 待确认 '+e.pending+' · 覆盖 '+e.coverage+'%</p><p>单独单词 '+e.standaloneStats.correct+' / '+e.standaloneStats.total+' · 词组内部 '+e.phraseStats.correct+' / '+e.phraseStats.total+' · 长期状态：'+e.status+'</p><p>短期观察（不代表长期结论）：'+esc(e.observations.map(v=>v.label).join('；')||'暂无')+'</p><p>最近正确：'+esc(last(e.lastCorrect))+'<br>最近错误：'+esc(last(e.lastIncorrect))+'</p><p>错误写法：'+(e.typos.map(v=>esc(v.input||'漏写')+' × '+v.n).join('；')||'—')+'</p><p class="notice">基本掌握需至少8次有效记录、3个日期、跨度7天且最近6次跨2日期全对；固化/不稳定需至少6次有效记录与3个日期。固化还需同错拼至少3次跨2日、最近仍错。</p><div class="table-wrap"><table><thead><tr><th>日期 / 原题</th><th>原始输入</th><th>词级输入 / 判定</th><th>来源</th></tr></thead><tbody>'+e.occurrences.map(v=>'<tr><td>'+esc(v.day)+'<br>'+esc(v.context)+'</td><td>'+esc(v.rawInput===null?'缺少原始输入':v.rawInput||'未作答')+'</td><td>'+esc(v.input||'—')+'<br>'+({correct:'正确',incorrect:'错误',omission:'漏写',pending:'待确认'}[v.verdict])+' · '+esc(v.reason)+'</td><td>'+esc(v.sid)+' #'+(Number.isInteger(v.index)?v.index+1:'—')+'<br>'+button('原答卷','record','data-id="'+esc(v.recordId)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>',true);
   }
   function frequencyTable() {
     const list = filteredFrequency(), total = list.reduce((sum,entry) => sum+entry.n,0);
@@ -3727,18 +3794,35 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const timedOut = session.inputs.filter((value, i) => !value.trim() && session.states[i] === 'timeout' && session.timedOut?.includes(i)).length;
     modal('完成这次练习？', skipped || timedOut ? `已主动跳过 ${skipped} 词、超时未答 ${timedOut} 词，批改时计入错词。` : '批改后可查看正确率，并针对错词再练一次。', `<div class="hint-box">${esc(titleOf(session.sid))} · ${session.items.length} 词 · 专注 ${time(session.elapsed)}</div><div class="modal-footer">${button('继续练习', 'close-modal')}${button('提交并查看结果', 'finish-confirm', '', 'primary')}</div>`);
   }
+  function recoverEvidenceWrite() {
+    const patch=read('pendingWrite',null);if(!patch)return true;
+    try {
+      const nextRecords=C.mergeRecords(read('records',[]),patch.records||[]),nextWrong=C.mutateWrong(read('wrong',{}),{type:'merge',wrong:patch.wrong||{}});
+      if(patch.records?.length&&!save('records',nextRecords))return false;
+      if(Object.keys(patch.wrong||{}).length&&!save('wrong',nextWrong))return false;
+      for(const [name,value]of Object.entries(patch.extras||{}))if(!save(name,value))return false;
+      if(!save('pendingWrite',null))return false;
+      records=nextRecords;wrong=nextWrong;return true;
+    }catch(error){toast('保存变更待恢复：'+error.message);return false;}
+  }
+  function writeEvidence(nextRecords,nextWrong,extras={}) {
+    if(!recoverEvidenceWrite())return false;
+    const additions=nextRecords.filter(record=>!records.some(old=>old.id===record.id)),changes={};
+    // Validate conflicts before durable writes. Journal contains a delta, never a second full history.
+    C.mergeRecords(records,nextRecords);
+    for(const [word,entry]of Object.entries(nextWrong))if(C.stableJSON(wrong[word])!==C.stableJSON(entry))Object.defineProperty(changes,word,{value:entry,enumerable:true});
+    if(!save('pendingWrite',{version:1,records:additions,wrong:changes,extras}))return false;
+    return recoverEvidenceWrite();
+  }
   function commitSession(target = session) {
-    if (!canFinish(target)) return null;
-    const rec = C.makeRecord(target, settings, RULES, titleOf(target.sid));
-    if (!records.some(r => r.id === rec.id)) {
-      const nextRecords = [...records, rec], nextWrong = {...wrong};
-      // Only append new evidence on an actual commit; analysis never rewrites saved counts or mastery.
-      rec.rows.forEach((row,rowIndex)=>{if(row.correct!==false)return;const old=nextWrong[row.w];Object.defineProperty(nextWrong,row.w,{value:{...old,sid:row.sid||rec.sid,index:row.index,in:row.in,n:(old?.n||0)+1,ts:rec.ts,mastered:!!old?.mastered,evidence:{recordId:rec.id,rowIndex}},enumerable:true,writable:true,configurable:true});});
-      if (!save('records', nextRecords)) return null;
-      if (!save('wrong', nextWrong)) { save('records', records); return null; }
-      records = nextRecords; wrong = nextWrong;
+    if (!canFinish(target)||!recoverEvidenceWrite()) return null;
+    const existing=records.find(record=>record.id===target.id);if(existing){
+      const raw=existing.rows.map(row=>[row.w,row.in,row.sid||existing.sid,row.index]),current=target.items.map((item,index)=>[item.w,target.inputs[index],item.sid||target.sid,item.index]);
+      if(C.stableJSON(raw)===C.stableJSON(current))return existing;
+      persistDraft();modal('上次提交已恢复','当前修改与已保存的原提交不同，草稿已保留。请选择查看原提交，或将修改另存为新练习；不会覆盖原答卷。','<div class="modal-footer">'+button('查看已恢复原提交','commit-conflict-view')+button('将当前修改另存为新练习','commit-conflict-new','','primary')+'</div>');return null;
     }
-    return rec;
+    const rec=C.makeRecord(target,settings,RULES,titleOf(target.sid)),nextWrong=C.mutateWrong(wrong,{type:'record',record:rec,now:Date.now()});
+    if(!writeEvidence([...records,rec],nextWrong))return null;return rec;
   }
   function finish() {
     captureAnswers();
@@ -3968,14 +4052,16 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     } catch (error) { toast(`未从服务读取成功：${error.message}。本机待办未改动。`); }
   }
   function importLegacy() {
-    const imported = read('imported', []); let count = 0;
-    Object.entries(window.DICT_LEGACY_RECORDS || {}).forEach(([sid, rows]) => rows.forEach(r => {
-      const id = sid + ':' + r.w;
-      if (imported.includes(id) || C.scoreGrade(r.in, r.w, { ...settings, looseRules: true }, RULES).correct) return;
-      if (!wrong[r.w]) { wrong[r.w] = { sid, n: 1, ts: Date.now(), in: r.in, mastered: false }; count++; }
-      imported.push(id);
+    if(!recoverEvidenceWrite())return;let nextWrong=wrong,count=0;const imported=read('imported',[]).slice();
+    Object.entries(window.DICT_LEGACY_RECORDS||{}).forEach(([sid,rows])=>rows.forEach((row,rowIndex)=>{
+      if(C.scoreGrade(row.in,row.w,{...settings,looseRules:true},RULES).correct)return;
+      const id=C.stableJSON(['bundled-legacy-records',sid,rowIndex,row.w,row.in]);
+      if(imported.includes(id))return;
+      const index=D.words[sid]?.findIndex(item=>item.w===row.w),snapshot={word:row.w,sid,index:index>=0?index:undefined,hasInput:typeof row.in==='string',n:1,sourceId:id};if(snapshot.hasInput)snapshot.in=row.in;
+      const entry=C.evidenceEntry(row.w,Object.hasOwn(nextWrong,row.w)?nextWrong[row.w]:{});entry.legacySnapshots[id]=snapshot;
+      nextWrong={...nextWrong};Object.defineProperty(nextWrong,row.w,{value:entry,enumerable:true});imported.push(id);count++;
     }));
-    save('wrong', wrong); save('imported', imported); closeModal(); render(); toast(count ? `已导入 ${count} 个错词，未创建虚构的历史成绩。` : '已有错词已导入，无需重复添加。');
+    if(!writeEvidence(records,nextWrong,{imported}))return;closeModal();render();toast(count?`已导入 ${count} 条原始错词证据，未创建虚构的历史成绩。`:'已有错词已导入，无需重复添加。');
   }
   function download(name, content, type) { const url = URL.createObjectURL(new Blob([content], { type })); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
   const csvCell = value => '"' + String(value ?? '').replace(/^[=+@-]/, "'$&").replace(/"/g, '""') + '"';
@@ -3997,7 +4083,8 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function backupData() {
     captureAnswers(); persistDraft();
     const draft = validDraft(session) ? session : read('draft', null);
-    return { version: 5, records, wrong, settings, vocabularyTypes, audioCorrections,
+    const intent=read('pendingWrite',null),backupRecords=intent?C.mergeRecords(records,intent.records||[]):records,backupWrong=intent?C.mutateWrong(wrong,{type:'merge',wrong:intent.wrong||{}}):wrong;
+    return { version: 5, records:backupRecords, wrong:backupWrong, settings, vocabularyTypes, audioCorrections,
       paper: read('paper',null), draft, drafts: savedDrafts().filter(d => d.id !== draft?.id) };
   }
   function exportBackupCSV() {
@@ -4042,16 +4129,15 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     input.onchange = async () => {
       try {
         const parsed = JSON.parse(await input.files[0].text());
-        if (!Array.isArray(parsed.records) || !parsed.wrong || typeof parsed.wrong !== 'object' || Array.isArray(parsed.wrong) || parsed.records.some(r => typeof r.id !== 'string' || typeof r.sid !== 'string' || !Array.isArray(r.rows) || !Number.isFinite(r.ts) || !Number.isFinite(r.ms) || r.rows.some(w => !w||typeof w.w !== 'string' || (w.in!==undefined&&typeof w.in !== 'string'))) || Object.values(parsed.wrong).some(w => !w || typeof w.sid !== 'string' || !Number.isFinite(w.n))) throw new Error('invalid');
-        if(parsed.paper?.items?.length&&!read('paper',null))save('paper',parsed.paper);
-        const features = F.mergeFeatureBackup(D, vocabularyTypes, audioCorrections, parsed);
-        if (!save('drafts', mergeDraftBackup(parsed))) return;
-        const known = new Set(records.map(r => r.id)); records.push(...parsed.records.filter(r => {if(known.has(r.id))return false;known.add(r.id);return true;})); records.sort((a, b) => a.ts - b.ts);
-        Object.entries(parsed.wrong).forEach(([word, value]) => { if (!wrong[word] || value.ts > wrong[word].ts) Object.defineProperty(wrong, word, { value, enumerable: true, configurable: true, writable: true }); });
-        if (parsed.settings) settings = sanitizeSettings(parsed.settings);
-        vocabularyTypes = features.vocabularyTypes; audioCorrections = features.audioCorrections;
-        save('records', records); save('wrong', wrong); save('settings', settings); save('vocabularyTypes', vocabularyTypes); save('audioCorrections', audioCorrections); render(); toast('备份已合并恢复，现有记录、音频待办与未完成草稿已保留。');
-      } catch { toast('无法读取这个备份，请选择听写室导出的 JSON 文件。'); }
+        if (!Array.isArray(parsed.records) || !parsed.wrong || typeof parsed.wrong !== 'object' || Array.isArray(parsed.wrong) || parsed.records.some(r => typeof r.id !== 'string' || typeof r.sid !== 'string' || !Array.isArray(r.rows) || !Number.isFinite(r.ts) || !Number.isFinite(r.ms) || r.rows.some(w => !w||typeof w.w !== 'string' || (w.in!==undefined&&typeof w.in !== 'string'))) || Object.values(parsed.wrong).some(w => !C.validWrongEntry(w))) throw new Error('invalid');
+        if(!recoverEvidenceWrite())return;
+        const nextRecords=C.mergeRecords(records,parsed.records),nextWrong=C.mutateWrong(wrong,{type:'merge',wrong:parsed.wrong});
+        const features=F.mergeFeatureBackup(D,vocabularyTypes,audioCorrections,parsed),nextSettings=parsed.settings?sanitizeSettings(parsed.settings):settings;
+        const extras={drafts:mergeDraftBackup(parsed),settings:nextSettings,vocabularyTypes:features.vocabularyTypes,audioCorrections:features.audioCorrections};
+        if(parsed.paper?.items?.length&&!read('paper',null))extras.paper=parsed.paper;
+        if(!writeEvidence(nextRecords,nextWrong,extras))return;
+        settings=nextSettings;vocabularyTypes=features.vocabularyTypes;audioCorrections=features.audioCorrections;render();toast('备份已合并恢复，现有记录、原始证据与掌握状态已保留。');
+      } catch(error) { toast(error.message?.startsWith('record-id-conflict')?'备份存在同 ID 不同原答卷，整次恢复已拒绝。':'无法读取这个备份，请选择听写室导出的 JSON 文件。'); }
     }; input.click();
   }
   function sanitizeSettings(value) {
@@ -4155,6 +4241,8 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       case 'previous': move(-1); break;
       case 'submit': submit(); break;
       case 'finish': finishPrompt(); break;
+      case 'commit-conflict-view': {if(!session||!persistDraft())break;result=records.find(record=>record.id===session.id)||null;if(!result)break;session=null;closeModal();navigate('result',false);break;}
+      case 'commit-conflict-new': {if(!session)break;session.id=session.id+'-revision-'+Date.now()+'-'+Math.random().toString(36).slice(2,8);if(!persistDraft())break;closeModal();refreshPractice(true);finishPrompt();break;}
       case 'finish-confirm': finish(); break;
       case 'layout': persistDraft(); settings.immerse = d.value === 'immerse'; save('settings', settings); refreshPractice(true); break;
       case 'practice-filter': { if (!session) break; const hasWrong = session.items.some(w => currentWrong()[w.w] && !currentWrong()[w.w].mastered&&!currentWrong()[w.w].pending); if (d.value === 'wrong' && !hasWrong) { toast('这一组还没有历史错词。'); break; } captureAnswers(); stopAudio(); session.filter = d.value; const indices = visibleIndices(); if (!indices.includes(session.idx)) session.idx = indices[0]; persistDraft(); refreshPractice(true); break; }
@@ -4170,12 +4258,12 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       case 'frequency-sources': showFrequencySources(d.word); break;
       case 'review-frequency': reviewFrequency(d.word); break;
       case 'export-frequency': exportFrequency(); break;
-      case 'master': if(!Object.hasOwn(wrong,d.word))Object.defineProperty(wrong,d.word,{value:{...currentWrong()[d.word]},enumerable:true,configurable:true,writable:true});wrong[d.word].mastered = !wrong[d.word].mastered; save('wrong', wrong); render(); toast(currentWrong()[d.word]?.pending?'掌握标记已保存；证据仍待确认。':wrong[d.word].mastered?'已标记掌握，可在「已掌握」中移回。':'已移回待复习。'); break;
+      case 'master': {if(!recoverEvidenceWrite())break;const next=C.mutateWrong(wrong,{type:'master',word:d.word,value:!currentWrong()[d.word]?.mastered,now:Date.now(),actionId:'master:'+Date.now()+':'+Math.random()});if(!writeEvidence(records,next))break;render();toast(currentWrong()[d.word]?.pending?'掌握标记已保存；证据仍待确认。':next[d.word].mastered?'已标记掌握，可在「已掌握」中移回。':'已移回待复习。');break;}
       case 'review-all': { if (wrongFilter === 'frequency') { reviewFrequency(); break; } const items = reviewItems(filteredWrong().filter(([, w]) => !w.mastered&&!w.pending)); if (!items.length) return toast('当前筛选下没有待复习的单词。'); openSetup(wrongChapter === 'all' ? 'review' : wrongChapter, items); break; }
       case 'retry-wrong': { const items = C.retryItems(D,C.recordView(result,RULES)); openSetup(result.sid, items); break; }
       case 'retry': openSetup(result.sid, result.rows.map(r => C.itemForRow(D, r, result.sid)).filter(Boolean)); break;
       case 'speak': { const item = C.itemsFor(D, d.sid)[Number(d.index)]; if (item) speak(item, true); else toast('未找到这个词的原音。'); break; }
-      case 'save-marks': { session.marked.forEach(i => { const w = session.items[i]; wrong[w.w] = { sid: w.sid, index: w.index, manual:true, n: wrong[w.w]?.n || 1, in: wrong[w.w]?.in || '', ts: Date.now(), mastered: false }; }); save('wrong', wrong); const count = session.marked.length; session = null; navigate('wrong'); toast(`已保存 ${count} 个标记错词。`); break; }
+      case 'save-marks': {if(!recoverEvidenceWrite())break;const items=session.marked.map(i=>session.items[i]),next=C.mutateWrong(wrong,{type:'manual',items,now:Date.now(),actionId:'manual:'+Date.now()+':'+Math.random()});if(!writeEvidence(records,next))break;const count=items.length;session=null;navigate('wrong');toast(`已保存 ${count} 个标记错词。`);break;}
       case 'game-tile': gamePick(Number(d.index)); break;
       case 'restart-game': newGame(); session.states.fill(''); refreshPractice(); break;
       case 'legacy': importLegacy(); break;
@@ -4265,6 +4353,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   window.visualViewport?.addEventListener('resize', visualViewportChanged);
   window.visualViewport?.addEventListener('scroll', visualViewportChanged);
   document.addEventListener('visibilitychange', () => { if (document.hidden) { persistDraft(); paper.stop(); stopAudio(); } else if (route === 'practice' && session) refreshPractice(false); });
+  recoverEvidenceWrite();
   settings = sanitizeSettings(settings);
   if (location.hash === '#practice') { const draft = read('draft', null); if (validDraft(draft)) session = restoredDraft(draft); }
   result = records.find(r => r.id === read('result', null)) || null;
