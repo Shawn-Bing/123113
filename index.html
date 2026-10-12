@@ -2487,9 +2487,21 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       mode: session.order === 'shuffle' ? 'shuffle' : session.mode, ts: now, ms: session.elapsed || 0,
       ...recordTotals(rows), rows};
   }
-  const recordViews=new WeakMap();
+  const recordViews=new WeakMap(),rawSources=new WeakMap();
+  const sourceRecord=record=>rawSources.get(record)||record;
+  function originalImmediate(record,rowIndex) {
+    record=sourceRecord(record);const row=record?.rows?.[rowIndex];if(!row)return null;
+    if(typeof row.liveCorrect==='boolean')return row.liveCorrect;
+    if(record.grading==='book')return null;
+    const grading=record.liveGrading||record.grading;
+    if(['strict','loose'].includes(grading)&&typeof row[grading]==='boolean')return row[grading];
+    // Book/current learning totals do not prove what the original live feedback showed.
+    if(grading!=='book'&&typeof row.correct==='boolean')return row.correct;
+    return null;
+  }
   function recordView(record,rules={},signature=ruleSignature(rules)) {
     if(!record||!Array.isArray(record.rows))return null;
+    record=sourceRecord(record);
     const rawKey=JSON.stringify([record.mode,record.ignoreCase,record.rows.map(row=>[row?.w,row?.in])]);
     const cached=recordViews.get(record);if(cached?.signature===signature&&cached.rawKey===rawKey)return cached.view;
     const supported=['normal','dictation','shuffle','wrong'].includes(record.mode);
@@ -2499,7 +2511,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       return {...row,correct:null,strict:null,loose:null,liveCorrect:null,acceptedBy:[],assessment:{learningCorrect:null,strictCorrect:null,formatIssues:[],acceptedBy:[],pending:true}};
     });
     const view={...record,rows,...recordTotals(rows),analysisVersion:ANALYSIS_VERSION,rulesSignature:signature,grading:'book',originalScore:record.originalScore??record.pct??record.pctLoose??null};
-    recordViews.set(record,{signature,rawKey,view});return view;
+    rawSources.set(view,record);recordViews.set(record,{signature,rawKey,view});return view;
   }
   function analyzeRecord(record,rules={}) {
     if(!record||!['normal','dictation','shuffle','wrong'].includes(record.mode))return null;
@@ -2511,30 +2523,44 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const signature=ruleSignature(rules),seen=new Set();return records.filter(record=>record&&typeof record.id==='string'&&!seen.has(record.id)&&seen.add(record.id)).map(record=>recordView(record,rules,signature)).filter(Boolean);
   }
   function deriveWrong(records,stored={},rules={}) {
-    const result=Object.create(null),observed=new Set();
+    const result=Object.create(null),evidence=new Map();
+    const identity=(record,row,rowIndex)=>({recordId:record.id,rowIndex,sid:row.sid||record.sid,index:row.index,input:row.in,ts:record.ts});
     for(const record of historyViews(records,rules)) {
       if(!['normal','dictation','shuffle','wrong'].includes(record.mode))continue;
-      for(const row of record.rows) {
-        if(typeof row.w!=='string')continue;observed.add(row.w);
-        if(row.correct!==false)continue;
-        const previous=result[row.w],saved=Object.hasOwn(stored,row.w)?stored[row.w]:{};
-        result[row.w]={...saved,sid:row.sid||record.sid,index:row.index,in:row.in,n:(previous?.n||0)+1,ts:record.ts,mastered:!!saved.mastered};
-      }
+      record.rows.forEach((row,rowIndex)=>{
+        if(typeof row.w!=='string')return;
+        if(!evidence.has(row.w))evidence.set(row.w,[]);
+        evidence.get(row.w).push({...identity(record,row,rowIndex),correct:row.correct});
+        if(row.correct!==false)return;
+        const previous=result[row.w],saved=Object.hasOwn(stored,row.w)?stored[row.w]:{},n=(previous?.n||0)+1;
+        result[row.w]={...saved,sid:row.sid||record.sid,index:row.index,in:row.in,n,ts:record.ts,mastered:!!saved.mastered,pending:false,provenance:{historyErrors:n,legacy:'none'}};
+      });
     }
     for(const [word,saved]of Object.entries(stored)) {
-      if(result[word])continue;
-      if(saved.manual){result[word]={...saved,n:0,manual:true};continue;}
-      if(observed.has(word))continue;
-      // Imported wrong-only evidence cannot invent a historical denominator.
-      if(typeof saved.in==='string'&&normalize(saved.in)) {
-        if(!scoreGrade(saved.in,word,{ignoreCase:true,looseRules:true},rules).correct)result[word]={...saved,n:1,legacyCount:saved.n,legacyPending:Math.max(0,saved.n-1)};
-      }else result[word]={...saved,n:0,pending:true,legacyCount:saved.n};
+      const current=result[word],rows=evidence.get(word)||[];
+      if(saved.manual&&!current){result[word]={...saved,n:0,manual:true,pending:false,provenance:{historyErrors:0,legacy:'manual'}};continue;}
+      if(typeof saved.in!=='string'||!normalize(saved.in)) {
+        if(current){current.legacyEvidence={...saved,state:'missing-input'};current.legacyCount=saved.n;}
+        else result[word]={...saved,n:0,pending:true,legacyCount:saved.n,provenance:{historyErrors:0,legacy:'missing-input'}};
+        continue;
+      }
+      // Rejudge the saved literal first: accepted format mistakes never return to review.
+      if(scoreGrade(saved.in,word,{ignoreCase:true,looseRules:true},rules).correct)continue;
+      const explicit=saved.evidence;
+      const matches=rows.filter(row=>row.input===saved.in&&row.sid===saved.sid&&
+        (explicit?row.recordId===explicit.recordId&&row.rowIndex===explicit.rowIndex:
+          Number.isFinite(saved.ts)&&row.ts===saved.ts&&Number.isInteger(saved.index)&&row.index===saved.index));
+      if(matches.length===1){if(current)current.provenance.legacy='matched';continue;}
+      if(current){
+        // The old last error may be one of the complete rows. Keep it visible, never double-count a guess.
+        current.legacyEvidence={...saved,state:'unresolved-link'};current.legacyCount=saved.n;current.provenance.legacy='unresolved-link';
+      }else result[word]={...saved,n:1,pending:false,legacyCount:saved.n,legacyPending:Math.max(0,saved.n-1),provenance:{historyErrors:0,legacy:'independent'},legacyEvidence:{...saved,state:'independent'}};
     }
     return result;
   }
   function updateWrong(previous, record) {
     const result = JSON.parse(JSON.stringify(previous));
-    record.rows.forEach(row => {
+    record.rows.forEach((row,rowIndex) => {
       const sid = row.sid || record.sid;
       // Migrate an explicitly renamed entry only at its original chapter/index.
       for (const previous of row.previousWords || []) {
@@ -2551,7 +2577,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
         }
       } else {
         const old = result[row.w];
-        result[row.w] = { sid, index: row.index, n: (old?.n || 0) + 1, ts: record.ts, in: row.in, mastered: false };
+        result[row.w] = { sid, index: row.index, n: (old?.n || 0) + 1, ts: record.ts, in: row.in, mastered: false,evidence:{recordId:record.id,rowIndex} };
       }
     });
     return result;
@@ -2646,7 +2672,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return { total: data.words[sid]?.length || 0, practiced: practiced.size,
       attempts: history.length, last: history.at(-1) || null, drafts: saved };
   }
-  return { ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
+  return { sourceRecord,originalImmediate,ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
 });
 
 </script>
@@ -2733,7 +2759,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const latestRound=valid.at(-1)?.recordId,round=valid.filter(v=>v.recordId===latestRound);
     const roundCorrect=round.filter(v=>v.verdict==='correct').length,roundIncorrect=round.length-roundCorrect;
     const repeatedTypos=[...typos].filter(([input,n])=>input&&n>=2).map(([input,n])=>({input,n}));
-    let correctStreak=0;for(let i=occurrences.length-1;i>=0&&occurrences[i].verdict==='correct';i--)correctStreak++;
+    let correctStreak=0;for(let i=valid.length-1;i>=0&&valid[i].verdict==='correct';i--)correctStreak++;
     const observations=[],observe=(code,label)=>observations.push({code,label});
     if(correct&&incorrect)observe('history-mixed','历史正误混合（'+correct+'对'+incorrect+'错）');
     if(roundCorrect&&roundIncorrect)observe('round-mixed','本轮拼写不稳定（'+roundCorrect+'对'+roundIncorrect+'错）');
@@ -2741,7 +2767,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if(incorrect===1&&correct>=4)observe('occasional-error','偶发错误（'+correct+'对1错）');
     if(roundIncorrect>=2)observe('round-errors','同轮重复错误（'+roundIncorrect+'次）');
     if(incorrect>=2)observe('multiple-errors','多次拼写错误（'+incorrect+'次）');
-    if(['incorrect','omission'].includes(occurrences.at(-1)?.verdict))observe('latest-error','最近一次有效记录错误');
+    if(['incorrect','omission'].includes(valid.at(-1)?.verdict))observe('latest-error','最近一次有效记录错误');
     if(correctStreak>=2)observe('correct-streak','最近连续正确（'+correctStreak+'次）');
     const shortTerm={latestRound,roundCorrect,roundIncorrect,roundMixed:!!(roundCorrect&&roundIncorrect),mixed:!!(correct&&incorrect),repeatedTypos,correctStreak};
 
@@ -2999,7 +3025,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       const sid=filters[chapter] || 'all', points=series(records,sections,chapter,sid,now,rules), last=points.at(-1);
       return `<article class="trend-card panel"><div class="trend-card-head"><div><span class="insight-eyebrow">CHAPTER ${esc(chapter.slice(1))}</span><h3>${esc(name)}</h3></div><div class="trend-latest"><strong>${last?`${last.pct}<small>%</small>`:'—'}</strong><span>最近正确率</span></div></div><label class="trend-scope"><span class="sr-only">Chapter ${esc(chapter.slice(1))} 趋势范围</span><select class="select" data-trend-chapter="${chapter}"><option value="all">本章全部 Test</option>${sections.filter(s=>s.chapter===chapter).map(s=>`<option value="${esc(s.id)}" ${sid===s.id?'selected':''}>Test ${s.test}</option>`).join('')}</select><small>${points.length?`最近 ${points.length} 次 · 按练习顺序`:'等待第一次听写'}</small></label>${curve(points,name)}${points.length?`<details class="trend-data"><summary>查看练习数据</summary><table><caption class="sr-only">${esc(name)}正确率趋势数据</caption><thead><tr><th>时间</th><th>正确 / 总词数</th><th>正确率</th></tr></thead><tbody>${points.slice().reverse().map(p=>`<tr><td><button class="text-btn" data-act="record" data-id="${esc(p.id)}">${esc(new Date(p.ts).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}))}</button></td><td>${p.correct} / ${p.total}</td><td>${p.pct}%</td></tr>`).join('')}</tbody></table></details>`:''}</article>`;
     }).join('');
-    return `<section class="learning-insights" aria-label="学习活动与正确率"><div class="section-top"><h2>学习足迹 <span>一点积累，慢慢看见</span></h2><button class="text-btn" data-act="storage-help">记录如何保存？</button></div><article class="activity-panel panel"><div class="activity-head"><div><strong>${stats.activeDays}</strong><span>天有练习</span><span class="activity-divider"></span><b>${stats.total.toLocaleString('zh-CN')}</b><span>词次</span><span class="activity-streak">连续 ${stats.streak} 天</span></div><label><span class="sr-only">热力图时间范围</span><select class="select" id="activity-range">${[[91,'近三个月'],[182,'近半年'],[365,'近一年']].map(([n,label])=>`<option value="${n}" ${stats.days===n?'selected':''}>${label}</option>`).join('')}</select></label></div><div class="heatmap-scroll"><div class="heatmap-frame" style="--heat-weeks:${weeks}"><div class="heat-months">${months.map(m=>`<span style="grid-column:${m.column}">${m.month}月</span>`).join('')}</div><div class="heat-weekdays" aria-hidden="true"><span>一</span><span>三</span><span>五</span><span>日</span></div><div class="heat-grid" role="group" aria-label="每日听写词次热力图">${cells}</div></div></div><div class="activity-footer"><p>${stats.total?'点击有练习的日期，查看当天记录。':'完成第一次听写，点亮你的第一格。'} 仅统计已完成听写，包含重练。</p><div class="heat-legend" aria-label="颜色越深，练习词次越多"><span>少</span>${[0,1,2,3,4].map(n=>`<i class="heat-cell heat-${n}"></i>`).join('')}<span>多</span></div></div></article><div class="section-top trend-section-heading"><h2>章节正确率趋势 <span>4 个章节 · 可细看每个 Test</span></h2></div><div class="trend-grid">${cards}</div><p class="insights-note">正确率沿用每次练习的判分设置；混合错词练习按词条所属章节统计。不同词量、模式的成绩供对照。</p></section>`;
+    return `<section class="learning-insights" aria-label="学习活动与正确率"><div class="section-top"><h2>学习足迹 <span>一点积累，慢慢看见</span></h2><button class="text-btn" data-act="storage-help">记录如何保存？</button></div><article class="activity-panel panel"><div class="activity-head"><div><strong>${stats.activeDays}</strong><span>天有练习</span><span class="activity-divider"></span><b>${stats.total.toLocaleString('zh-CN')}</b><span>词次</span><span class="activity-streak">连续 ${stats.streak} 天</span></div><label><span class="sr-only">热力图时间范围</span><select class="select" id="activity-range">${[[91,'近三个月'],[182,'近半年'],[365,'近一年']].map(([n,label])=>`<option value="${n}" ${stats.days===n?'selected':''}>${label}</option>`).join('')}</select></label></div><div class="heatmap-scroll"><div class="heatmap-frame" style="--heat-weeks:${weeks}"><div class="heat-months">${months.map(m=>`<span style="grid-column:${m.column}">${m.month}月</span>`).join('')}</div><div class="heat-weekdays" aria-hidden="true"><span>一</span><span>三</span><span>五</span><span>日</span></div><div class="heat-grid" role="group" aria-label="每日听写词次热力图">${cells}</div></div></div><div class="activity-footer"><p>${stats.total?'点击有练习的日期，查看当天记录。':'完成第一次听写，点亮你的第一格。'} 仅统计已完成听写，包含重练。</p><div class="heat-legend" aria-label="颜色越深，练习词次越多"><span>少</span>${[0,1,2,3,4].map(n=>`<i class="heat-cell heat-${n}"></i>`).join('')}<span>多</span></div></div></article><div class="section-top trend-section-heading"><h2>章节正确率趋势 <span>4 个章节 · 可细看每个 Test</span></h2></div><div class="trend-grid">${cards}</div><p class="insights-note">历史正确率按当前统一学习规则派生；原成绩保留在原记录和 JSON 备份。混合错词练习按词条所属章节统计。不同词量、模式的成绩供对照。</p></section>`;
   }
   function resolveReportTarget(data, input) {
     const errors = {}, section = data.sections.find(s=>s.id===input.sid && s.chapter===input.chapter);
@@ -3267,15 +3293,16 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function wrongPage() {
     const frequent = wrongFilter === 'frequency', frequency = filteredFrequency();
-    const reviewCount = frequent ? W.practiceItems(D, frequency).length : pending().length;
+    const reviewCount=frequent?W.practiceItems(D,frequency).length:filteredWrong().filter(([,w])=>!w.mastered&&!w.pending).length;
     return heading('错词复习', '把不熟悉的，再听一次。每个错词都是进步的起点。', button('听音默写','paper-setup','','primary') + button('正确答案 TXT','answers-txt') + button(icon('download', 15) + (frequent ? ' 导出统计' : ' 导出错词'), frequent ? 'export-frequency' : 'export-wrong')) +
-      `<div class="wrong-banner panel">${icon('edit', 30)}<div class="grow"><h2>${frequent ? `找到 ${frequency.length} 个高频错词，按错误次数逐个巩固。` : pending().length ? `还有 ${num(pending().length)} 个单词，值得再练一次。` : '今天，从熟悉一个新单词开始。'}</h2><p>${frequent ? '单词与词组中的同一错词合并累计；可查看来源并复习对应原词条。' : '听写结束后自动收录错词，支持按章节复习与标记掌握。'}</p></div>${button(icon('play', 14) + (frequent ? ' 按高频复习' : ' 开始复习'), 'review-all', reviewCount ? '' : 'disabled', 'primary')}</div><div class="toolbar wrong-toolbar"><div class="segmented" aria-label="错词状态">${[['pending', '待复习'], ['mastered', '已掌握'], ['frequency', '高频错词']].map(([v, label]) => `<button class="${wrongFilter === v ? 'active' : ''}" data-act="wrong-filter" data-value="${v}">${label} <small>${v === 'frequency' ? frequencyStats().length : Object.values(currentWrong()).filter(w => v === 'mastered' ? w.mastered : !w.mastered&&!w.pending).length}</small></button>`).join('')}</div><div class="row"><select class="select" id="wrong-chapter" aria-label="筛选错词章节"><option value="all">全部章节</option>${sections.map(s => `<option value="${s.id}" ${wrongChapter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select><label class="search">${icon('search', 14)}<input id="wrong-search" value="${esc(wrongSearch)}" placeholder="搜索单词…" aria-label="搜索错词"></label></div></div><div id="wrong-list">${wrongTable()}</div><div id="word-profiles">${profileTable()}</div>`;
+      `<div class="wrong-banner panel">${icon('edit', 30)}<div class="grow"><h2>${wrongBannerTitle()}</h2><p>${frequent ? '单词与词组中的同一错词合并累计；可查看来源并复习对应原词条。' : '听写结束后自动收录错词，支持按章节复习与标记掌握。'}</p></div>${button(icon('play', 14) + (frequent ? ' 按高频复习' : ' 开始复习'), 'review-all', reviewCount ? '' : 'disabled', 'primary')}</div><div class="toolbar wrong-toolbar"><div class="segmented" aria-label="错词状态">${[['pending','待复习'],['uncertain','待确认'],['mastered','已掌握'],['frequency','高频错词']].map(([v, label]) => `<button class="${wrongFilter === v ? 'active' : ''}" data-act="wrong-filter" data-value="${v}">${label} <small data-wrong-count="${v}">${v==='frequency'?filteredFrequency().length:wrongEntries(v).length}</small></button>`).join('')}</div><div class="row"><select class="select" id="wrong-chapter" aria-label="筛选错词章节"><option value="all">全部章节</option>${sections.map(s => `<option value="${s.id}" ${wrongChapter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select><label class="search">${icon('search', 14)}<input id="wrong-search" value="${esc(wrongSearch)}" placeholder="搜索单词…" aria-label="搜索错词"></label></div></div><div id="wrong-list">${wrongTable()}</div><div id="word-profiles">${profileTable()}</div>`;
   }
   function paperSetup() {
     const saved=read('paper',null);
-    modal('听音默写','在纸上作答，自评不计成绩。本轮按最近有效练习判断；历史正误混合与长期状态独立。','<div class="settings-panel">'+[['source',[['all','全部错词'],['latest','最近一轮错词'],['repeat','重复错误词'],['filtered','当前筛选'],['same-typo','重复相同错拼'],['round-unstable','本轮拼写不稳定'],['history-mixed','历史正误混合'],['long-fixed','长期固化错误'],['long-unstable','长期掌握不稳定']]],['shuffle',[[false,'顺序'],[true,'随机']]],['dedupe',[[true,'去重'],[false,'保留重复']]]].map(([key,choices])=>'<div class="option-group">'+choices.map(([v,label])=>button(label,'paper-option','data-key="'+key+'" data-value="'+v+'"',paperOptions[key]===v?'primary':'secondary')).join('')+'</div>').join('')+'</div><div class="modal-footer">'+button('开始听音默写','paper-start','','primary')+(saved?.items?.length?button('继续上次进度','paper-resume'):'')+'</div>');
+    modal('听音默写','在纸上作答，自评不计成绩。本轮按最近有效练习判断；历史正误混合与长期状态独立。连字符专项取当前章节（全部章节则取全语料），不受错词状态或搜索词影响。','<div class="settings-panel">'+[['source',[['all','全部错词'],['latest','最近一轮错词'],['repeat','重复错误词'],['filtered','当前筛选'],['hyphen','连字符专项'],['same-typo','重复相同错拼'],['round-unstable','本轮拼写不稳定'],['history-mixed','历史正误混合'],['long-fixed','长期固化错误'],['long-unstable','长期掌握不稳定']]],['shuffle',[[false,'顺序'],[true,'随机']]],['dedupe',[[true,'去重'],[false,'保留重复']]]].map(([key,choices])=>'<div class="option-group">'+choices.map(([v,label])=>button(label,'paper-option','data-key="'+key+'" data-value="'+v+'"',paperOptions[key]===v?'primary':'secondary')).join('')+'</div>').join('')+'</div><div class="modal-footer">'+button('开始听音默写','paper-start','','primary')+(saved?.items?.length?button('继续上次进度','paper-resume'):'')+'</div>');
   }
   function paperItems() {
+    if(paperOptions.source==='hyphen')return sections.filter(s=>wrongChapter==='all'||s.id===wrongChapter).flatMap(s=>C.itemsFor(D,s.id)).filter(item=>C.normalize(item.w).includes('-'));
     if(paperOptions.source==='latest') {const last=records.filter(r=>['normal','dictation','shuffle','wrong'].includes(r.mode)).slice().sort((a,b)=>b.ts-a.ts)[0];return last?C.retryItems(D,C.recordView(last,RULES)):[];}
     if(paperOptions.source==='filtered') return wrongFilter==='frequency'?W.practiceItems(D,filteredFrequency(),{dedupe:paperOptions.dedupe}):paperReviewItems(filteredWrong());
     if(paperOptions.source==='repeat') return W.practiceItems(D,frequencyStats().filter(e=>e.n>=2),{dedupe:paperOptions.dedupe});
@@ -3311,14 +3338,22 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if(act==='paper-self')paper.state.self={...paper.state.self,[paper.state.idx]:value};
     save('paper',paper.state);$('#paper-stage').innerHTML=paperStage(paper.state);
   }
-  function filteredWrong() { return Object.entries(currentWrong()).filter(([word, w]) => (wrongFilter === 'mastered' ? w.mastered : !w.mastered) && (wrongChapter === 'all' || w.sid === wrongChapter) && word.toLowerCase().includes(wrongSearch.toLowerCase())).sort((a, b) => b[1].n - a[1].n); }
+  function wrongBannerTitle(){const count=wrongFilter==='frequency'?filteredFrequency().length:filteredWrong().length;return wrongFilter==='uncertain'?`${count} 条旧记录待确认。`:wrongFilter==='mastered'?`${count} 个词条保留已掌握标记。`:wrongFilter==='frequency'?`找到 ${count} 个高频错词，按错误次数逐个巩固。`:count?`还有 ${count} 个单词，值得再练一次。`:'今天，从熟悉一个新单词开始。';}
+  function wrongEntries(group=wrongFilter){return Object.entries(currentWrong()).filter(([word,w])=>(group==='uncertain'?w.pending:group==='mastered'?w.mastered&&!w.pending:!w.mastered&&!w.pending)&&(wrongChapter==='all'||w.sid===wrongChapter)&&C.fold(word).includes(C.fold(wrongSearch))).sort((a,b)=>b[1].n-a[1].n);}
+  function filteredWrong(){return wrongEntries();}
+  function showWrongEvidence(word){
+    const entry=currentWrong()[word],saved=wrong[word];if(!entry)return;
+    const rows=records.flatMap(record=>(record.rows||[]).flatMap((row,index)=>row?.w===word?[{record,row,index}]:[]));
+    const body='<p class="notice">确定错误只计可靠答卷证据。独立旧错保留最后原始输入的一次证据；旧累计不代表已核实次数。无法确定是否与完整答卷重复的旧证据单列待核实，不叠加确定次数。缺原始输入的条目仍在待确认分组，掌握标记不改变证据状态。</p><dl><dt>保存的旧输入</dt><dd>'+esc(typeof saved?.in==='string'?saved.in||'空白':'缺少原始输入')+'</dd><dt>旧累计次数</dt><dd>'+esc(saved?.n??'—')+'</dd><dt>当前确定错误</dt><dd>'+entry.n+'</dd><dt>掌握标记</dt><dd>'+(entry.mastered?'已掌握（保留）':'未掌握')+'</dd></dl>'+ (rows.length?'<table><thead><tr><th>原记录 / 题号</th><th>原始输入</th><th>答卷</th></tr></thead><tbody>'+rows.map(({record,row,index})=>'<tr><td>'+esc(record.id)+' / '+(index+1)+'</td><td>'+esc(typeof row.in==='string'?row.in:'缺少原始输入')+'</td><td>'+button('查看原答卷','record','data-id="'+esc(record.id)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table>':'<p>未找到可证明对应的完整答卷；旧输入和原错本仍保存在 JSON 备份。</p>');
+    modal('原始证据 · '+esc(word),entry.pending?'待确认，不加入普通复习或 TXT':entry.legacyEvidence?'包含独立或待核实的旧错证据':'已定位完整答卷证据',body,true);
+  }
   function wrongTable() {
     if (wrongFilter === 'frequency') return frequencyTable();
     const list = filteredWrong();
     if (!list.length) return `<div class="panel">${empty('这里还没有错词', pending().length ? '换一个章节或搜索词看看。' : '完成一次听写后，错词会出现在这里。也可以导入项目已有的错词记录。', button('去练习', 'route', 'data-route="library"', 'primary') + ' ' + button('导入已有错词', 'legacy'))}</div>`;
     return `<div class="panel table-wrap"><table><thead><tr><th>单词 / 释义</th><th>最近输入</th><th>错误次数</th><th>来自章节</th><th>操作</th></tr></thead><tbody>${list.map(([word, w]) => {
       const item = F.retryItems(D, [[word, w]])[0];
-      return `<tr><td><strong class="english">${esc(word)}</strong><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="red">${esc(w.in || '未作答')}</td><td>${w.pending?'待确认':w.manual?'手动标记':w.n+' 次'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':'')}</td><td>${esc(w.sid)}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}">${w.mastered ? '移回待复习' : '标记掌握'}</button></div></td></tr>`;
+      return `<tr><td><strong class="english">${esc(word)}</strong><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="red">${esc(typeof w.in==='string'?w.in||'未作答':'原始输入缺失')}</td><td>${w.pending?'待确认':w.manual&&!w.n?'手动标记':w.n+' 次'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':'')+(w.legacyEvidence?.state==='unresolved-link'?' · 旧错证据待核实':'')}</td><td>${esc(w.sid)}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}">${w.pending?(w.mastered?'取消掌握标记（仍待确认）':'标记掌握（仍待确认）'):w.mastered?'移回待复习':'标记掌握'}</button><button class="text-btn" data-act="wrong-evidence" data-word="${esc(word)}">查看证据</button></div></td></tr>`;
     }).join('')}</tbody></table></div>`;
   }
   function frequencyStats() {
@@ -3329,12 +3364,11 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function filteredFrequency() { return W.filter(frequencyStats(), wrongChapter, wrongSearch); }
   function refreshWrongList() {
-    $('#wrong-list').innerHTML = wrongTable();
-    if (wrongFilter === 'frequency') {
-      const list=filteredFrequency(),heading=$('.wrong-banner h2'),review=$('.wrong-banner [data-act="review-all"]');
-      if (heading) heading.textContent=`找到 ${list.length} 个高频错词，按错误次数逐个巩固。`;
-      if (review) review.disabled=!W.practiceItems(D,list).length;
-    }
+    $('#wrong-list').innerHTML=wrongTable();
+    document.querySelectorAll('[data-wrong-count]').forEach(node=>{node.textContent=node.dataset.wrongCount==='frequency'?filteredFrequency().length:wrongEntries(node.dataset.wrongCount).length;});
+    const heading=$('.wrong-banner h2'),review=$('.wrong-banner [data-act="review-all"]');
+    if(heading)heading.textContent=wrongBannerTitle();
+    if(review)review.disabled=wrongFilter==='frequency'?!W.practiceItems(D,filteredFrequency()).length:!filteredWrong().some(([,w])=>!w.pending&&!w.mastered);
     if($('#word-profiles')) $('#word-profiles').innerHTML=profileTable();
     decorateAudioControls();
   }
@@ -3699,7 +3733,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if (!records.some(r => r.id === rec.id)) {
       const nextRecords = [...records, rec], nextWrong = {...wrong};
       // Only append new evidence on an actual commit; analysis never rewrites saved counts or mastery.
-      rec.rows.filter(row=>row.correct===false).forEach(row=>{const old=nextWrong[row.w];Object.defineProperty(nextWrong,row.w,{value:{...old,sid:row.sid||rec.sid,index:row.index,in:row.in,n:(old?.n||0)+1,ts:rec.ts,mastered:!!old?.mastered},enumerable:true,writable:true,configurable:true});});
+      rec.rows.forEach((row,rowIndex)=>{if(row.correct!==false)return;const old=nextWrong[row.w];Object.defineProperty(nextWrong,row.w,{value:{...old,sid:row.sid||rec.sid,index:row.index,in:row.in,n:(old?.n||0)+1,ts:rec.ts,mastered:!!old?.mastered,evidence:{recordId:rec.id,rowIndex}},enumerable:true,writable:true,configurable:true});});
       if (!save('records', nextRecords)) return null;
       if (!save('wrong', nextWrong)) { save('records', records); return null; }
       records = nextRecords; wrong = nextWrong;
@@ -3949,11 +3983,11 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function exportRecords(rs,selectedIndices=null) {
     if (!rs.length) return toast('完成一次练习后即可导出记录。');
     rs=rs.map(record=>C.recordView(record,RULES));
-    csvDownload('听写记录', [['章节','模式','正确率(%)','单词','我的输入','正确率判定','计分依据','即时判定','严格判定','规范判定','释义'],
-      ...rs.flatMap(r => r.rows.filter((_,i)=>!selectedIndices||selectedIndices.has(i)).map(w => [r.title, modeNames[r.mode] || r.mode, pct(r), w.w, w.in,
+    csvDownload('听写记录', [['章节','模式','正确率(%)','单词','我的输入','新版学习判定','计分依据','原始即时判定','严格判定','规范判定','释义','格式说明'],
+      ...rs.flatMap(r => r.rows.map((w,index)=>({w,index})).filter(({index})=>!selectedIndices||selectedIndices.has(index)).map(({w,index}) => [r.title, modeNames[r.mode] || r.mode, pct(r), w.w, w.in,
         w.correct===null?'待确认':w.correct ? '对' : '错', scoringReason(w),
-        w.correct===null?'待确认':w.correct?'对':'错',
-        w.strict===null?'待确认':w.strict?'对':'错',w.loose===null?'待确认':w.loose?'对':'错', w.m]))]);
+        C.originalImmediate(r,index)===null?'待确认':C.originalImmediate(r,index)?'对':'错',
+        w.strict===null?'待确认':w.strict?'对':'错',w.loose===null?'待确认':w.loose?'对':'错',w.m,w.assessment.formatIssues.map(v=>({whitespace:'空白规范化',boundary:'词界格式差异',case:'大小写','hyphen-character':'等价连字符规范化'}[v]||v)).join('、')]))]);
   }
   function backupMenu() {
     if (route === 'practice') { captureAnswers(); stopAudio(); }
@@ -3969,25 +4003,25 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function exportBackupCSV() {
     const data = backupData(), drafts = new Map(data.drafts.map(d => [d.id, d]));
     if (validDraft(data.draft)) drafts.set(data.draft.id, data.draft);
-    const rows = [['记录ID','状态','章节','模式','正确率(%)','原词表序号','单词','我的输入','当前判定','严格判定','规范判定','释义','错误次数','掌握状态','计分依据']];
-    for (const record of C.historyViews(data.records,RULES)) for (const word of record.rows) rows.push([
+    const rows = [['记录ID','状态','章节','模式','正确率(%)','原词表序号','单词','我的输入','当前判定','严格判定','规范判定','释义','错误次数','掌握状态','计分依据','原始即时判定']];
+    for (const record of C.historyViews(data.records,RULES)) for (const [rowIndex,word]of record.rows.entries()) rows.push([
       record.id, record.mode === 'legacy' ? '旧版错词' : '已完成', titleOf(word.sid || record.sid),
       modeNames[record.mode] || record.mode,
       record.mode === 'legacy' ? '' : pct(record), Number.isInteger(word.index) ? word.index+1 : '',
       word.w, word.in, word.correct===null?'待确认':word.correct ? '对' : '错',
-      word.strict===null?'待确认':word.strict?'对':'错',word.loose===null?'待确认':word.loose?'对':'错', word.m, '', '', scoringReason(word)
+      word.strict===null?'待确认':word.strict?'对':'错',word.loose===null?'待确认':word.loose?'对':'错', word.m,'','',scoringReason(word),C.originalImmediate(record,rowIndex)===null?'待确认':C.originalImmediate(record,rowIndex)?'对':'错'
     ]);
     for (const draft of drafts.values()) draft.items.forEach((item,i) => rows.push([
       draft.id, '未完成', titleOf(item.sid), draft.order === 'shuffle' ? '乱序听写' : '听写模式', '',
       item.index+1, item.w, draft.inputs[i] || '',
       draft.explicitSkips?.includes(i) && draft.states?.[i] === 'skip' ? '主动跳过' :
       draft.timedOut?.includes(i) && draft.states?.[i] === 'timeout' ? '超时未答' :
-      String(draft.inputs[i] || '').trim() ? '待批改' : '未作答', '', '', item.m, '', '', ''
+      String(draft.inputs[i] || '').trim() ? '待批改' : '未作答', '', '', item.m, '', '', '', ''
     ]));
     for (const [word,value] of Object.entries(C.deriveWrong(data.records,data.wrong,RULES))) rows.push([
       '', '错词本', titleOf(value.sid), '',
       '', Number.isInteger(value.index) ? value.index+1 : '', word, value.in, '', '', '', '', value.n,
-      value.pending?'待确认':value.mastered?'已掌握':value.manual?'手动标记':'待复习',value.legacyCount?'旧累计 '+value.legacyCount+' 次待确认':''
+      value.pending?'待确认':value.mastered?'已掌握':value.manual?'手动标记':'待复习',value.legacyCount?'旧累计 '+value.legacyCount+' 次待确认':'',''
     ]);
     csvDownload('听写室学习备份', rows);
   }
@@ -4131,11 +4165,12 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
         save('settings', settings); if (route === 'practice') { refreshPractice(); modal('学习设置', '调整后自动保存，继续练习即可生效。', settingsForm(), true); } else render(); break;
       }
       case 'toggle-setting': if (d.key === 'showCorrectAnswer' && !settings.showFeedback) break; settings[d.key] = !settings[d.key]; save('settings', settings); if (route === 'practice') { refreshPractice(); modal('学习设置', '调整后自动保存，继续练习即可生效。', settingsForm(), true); } else render(); break;
-      case 'wrong-filter': if (['pending','mastered','frequency'].includes(d.value)) { wrongFilter = d.value; render(); } break;
+      case 'wrong-evidence': showWrongEvidence(d.word);break;
+      case 'wrong-filter': if (['pending','uncertain','mastered','frequency'].includes(d.value)) { wrongFilter = d.value; render(); } break;
       case 'frequency-sources': showFrequencySources(d.word); break;
       case 'review-frequency': reviewFrequency(d.word); break;
       case 'export-frequency': exportFrequency(); break;
-      case 'master': if(!Object.hasOwn(wrong,d.word))Object.defineProperty(wrong,d.word,{value:{...currentWrong()[d.word]},enumerable:true,configurable:true,writable:true});wrong[d.word].mastered = !wrong[d.word].mastered; save('wrong', wrong); render(); toast(wrong[d.word].mastered ? '已标记掌握，可在「已掌握」中移回。' : '已移回待复习。'); break;
+      case 'master': if(!Object.hasOwn(wrong,d.word))Object.defineProperty(wrong,d.word,{value:{...currentWrong()[d.word]},enumerable:true,configurable:true,writable:true});wrong[d.word].mastered = !wrong[d.word].mastered; save('wrong', wrong); render(); toast(currentWrong()[d.word]?.pending?'掌握标记已保存；证据仍待确认。':wrong[d.word].mastered?'已标记掌握，可在「已掌握」中移回。':'已移回待复习。'); break;
       case 'review-all': { if (wrongFilter === 'frequency') { reviewFrequency(); break; } const items = reviewItems(filteredWrong().filter(([, w]) => !w.mastered&&!w.pending)); if (!items.length) return toast('当前筛选下没有待复习的单词。'); openSetup(wrongChapter === 'all' ? 'review' : wrongChapter, items); break; }
       case 'retry-wrong': { const items = C.retryItems(D,C.recordView(result,RULES)); openSetup(result.sid, items); break; }
       case 'retry': openSetup(result.sid, result.rows.map(r => C.itemForRow(D, r, result.sid)).filter(Boolean)); break;
