@@ -3453,9 +3453,27 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function showWrongEvidence(word){
     const entry=currentWrong()[word]&&C.projectWrong(currentWrong()[word],wrongChapter),saved=wrong[word];if(!entry)return;
     const rows=records.flatMap(record=>(record.rows||[]).flatMap((row,index)=>row?.w===word&&(wrongChapter==='all'||(row.sid||record.sid)===wrongChapter)?[{record,row,index}]:[]));
-    const snapshots=Object.values(C.evidenceEntry(word,saved||{}).legacySnapshots||{}).filter(value=>wrongChapter==='all'||value.sid===wrongChapter),snapshotTable=snapshots.length?'<h3>不可变旧证据</h3><table><thead><tr><th>原章节 / 序号</th><th>原始输入</th><th>旧累计声明（未核实）</th></tr></thead><tbody>'+snapshots.map(value=>'<tr><td>'+esc(value.sid)+' / '+(Number.isInteger(value.index)?value.index+1:'—')+'</td><td>'+esc(value.hasInput?value.in:'缺少原始输入')+'</td><td>'+esc(C.legacyRowId(value)?'独立原始行':value.n??'—')+'</td></tr>').join('')+'</tbody></table>':'';
-    const body='<p class="notice">确定错误只计可靠答卷证据。有稳定身份的旧原始行逐条计数；无身份的旧累计每个原题来源最多计一次，旧累计数字不代表已核实次数。无法确定是否与完整答卷重复的旧证据单列待核实，不叠加确定次数。缺原始输入的条目仍在待确认分组，掌握标记不改变证据状态。</p><dl><dt>当前范围最近有效输入</dt><dd>'+esc(typeof entry.in==='string'?entry.in||'空白':'缺少原始输入')+'</dd><dt>当前范围旧累计次数</dt><dd>'+esc(entry.legacyCount??'—')+'</dd><dt>当前确定错误</dt><dd>'+entry.n+'</dd><dt>掌握标记</dt><dd>'+(entry.mastered?'已掌握（保留）':'未掌握')+'</dd></dl>'+ (rows.length?'<table><thead><tr><th>原记录 / 题号</th><th>原始输入</th><th>答卷</th></tr></thead><tbody>'+rows.map(({record,row,index})=>'<tr><td>'+esc(record.id)+' / '+(index+1)+'</td><td>'+esc(typeof row.in==='string'?row.in:'缺少原始输入')+'</td><td>'+button('查看原答卷','record','data-id="'+esc(record.id)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table>':'<p>未找到可证明对应的完整答卷；旧输入和原错本仍保存在 JSON 备份。</p>');
-    modal('原始证据 · '+esc(word),entry.pending?'待确认，不加入普通复习或 TXT':entry.legacyEvidence?'包含独立或待核实的旧错证据':'已定位完整答卷证据',body+snapshotTable,true);
+    const snapshots=Object.values(C.evidenceEntry(word,saved||{}).legacySnapshots||{}).filter(value=>wrongChapter==='all'||value.sid===wrongChapter);
+    const occurrences=entry.sources.flatMap(source=>source.occurrences||[]);
+    const confirmed=occurrences.filter(value=>value.type==='history'||value.counted);
+    const unresolved=occurrences.filter(value=>['missing-input','unresolved-link','conflicting-source'].includes(value.state));
+    const cumulative=snapshots.filter(value=>!C.legacyRowId(value)&&Number.isFinite(value.n));
+    const sourceLabel=value=>esc(value.sid)+' / '+(Number.isInteger(value.index)?value.index+1:'—');
+    const rawInput=value=>esc(typeof value.input==='string'?value.input||'未作答':typeof value.in==='string'?value.in||'未作答':'缺少原始输入');
+    const evidenceTable=(values,label,describe)=>values.length?'<table><thead><tr><th>原章节 / 序号</th><th>原始输入</th><th>'+label+'</th></tr></thead><tbody>'+values.map(value=>'<tr><td>'+sourceLabel(value)+'</td><td>'+rawInput(value)+'</td><td>'+describe(value)+'</td></tr>').join('')+'</tbody></table>':'<p class="muted">当前范围没有这类证据。</p>';
+    const confirmedTable=evidenceTable(confirmed,'计数依据',value=>value.type==='history'?'答卷第 '+(value.rowIndex+1)+' 题 · 1 次 '+button('查看原答卷','record','data-id="'+esc(value.recordId)+'"','text-btn'):C.legacyRowId(value)?'独立旧原始行 · 1 次':'旧输入下限证据 · 1 次');
+    const unresolvedTable=evidenceTable(unresolved,'待核实原因',value=>({ 'missing-input':'缺少原始输入','unresolved-link':'无法确定与已有记录是否重复','conflicting-source':'同一旧原始行存在不同输入' }[value.state]));
+    const cumulativeTable=evidenceTable(cumulative,'保存的累计声明',value=>esc(value.n)+' 次（未验证）');
+    const manual=entry.sources.filter(source=>source.manual);
+    const archive=evidenceTable(snapshots,'原始声明',value=>C.legacyRowId(value)?'旧原始行':esc(value.n??'—'));
+    const rawRecords=rows.length?'<table><thead><tr><th>原记录 / 题号</th><th>原始输入</th><th>答卷</th></tr></thead><tbody>'+rows.map(({record,row,index})=>'<tr><td>'+esc(record.id)+' / '+(index+1)+'</td><td>'+rawInput(row)+'</td><td>'+button('查看原答卷','record','data-id="'+esc(record.id)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table>':'<p>当前范围未找到完整原答卷。</p>';
+    const body='<p>掌握标记：'+(entry.mastered?'已掌握（保留）':'未掌握')+'</p>'+
+      '<section data-evidence-group="confirmed"><h3>确定错误 · '+entry.n+' 次</h3><p>以下每条证据计一次错误，可作为复习来源；是否进入复习队列仍遵循掌握标记。</p>'+confirmedTable+(manual.length?'<p>另有手动标记来源：'+manual.map(sourceLabel).join('、')+'。手动标记可用于复习，不增加错误次数。</p>':'')+'</section>'+
+      '<section data-evidence-group="unresolved"><h3>待核实来源 · '+unresolved.length+' 条</h3><p>以下证据不增加确定错误次数，也不作为复习或 TXT 来源；标记掌握不会改变证据状态。</p>'+unresolvedTable+'</section>'+
+      '<section data-evidence-group="cumulative"><h3>未验证旧累计</h3><p>累计声明不等于已核实的错误次数。有有效错误输入时，每个原题来源最多保留一次旧输入下限证据，已列在“确定错误”；不能按累计数字生成多次练习。</p>'+cumulativeTable+'</section>'+
+      '<details><summary>查看原始记录与旧快照</summary>'+rawRecords+'<h3>不可变旧证据</h3>'+archive+'</details>';
+    const description=entry.hasPending&&!entry.pending?'确定错误或手动来源可用于复习；另有待核实证据，分别列明如下。':entry.pending?'当前来源待确认，不加入普通复习或 TXT。':'当前来源的计数依据与旧累计分别列明如下。';
+    modal('原始证据 · '+esc(word),description,body,true);
   }
   function wrongTable() {
     if (wrongFilter === 'frequency') return frequencyTable();
@@ -4158,9 +4176,9 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function mergeDraftBackup(parsed) {
     const retained = savedDrafts(), active = read('draft', null);
     const known = new Map([...retained, ...(validDraft(active) ? [active] : [])].map(value => [value.id, value]));
-    // Older releases used only the reserved suffix. Preserve that lineage when
-    // migrating; new collisions carry it explicitly through backup/export.
-    const sourceId = value => typeof value.importSourceId==='string'&&value.importSourceId ? value.importSourceId : value.id.replace(/(?:-import-\d+)+$/, '');
+    // A suffix is not provenance: old ambiguous IDs remain distinct. Only an
+    // explicit source ID can link a renamed import to its original draft.
+    const sourceId = value => typeof value.importSourceId==='string'&&value.importSourceId ? value.importSourceId : value.id;
     const signature = value => { const {id,importSourceId,...content}=value;return C.stableJSON(content); };
     for (const value of [parsed.draft, ...(Array.isArray(parsed.drafts) ? parsed.drafts : [])].filter(validDraft)) {
       const origin=sourceId(value),content=signature(value);

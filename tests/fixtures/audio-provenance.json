@@ -1,0 +1,18 @@
+[
+  {
+    "sid": "C11-T1",
+    "index": 2,
+    "word": "demonstration",
+    "url": "clips_reviewed/C11-T1/0002-5292bafb2708e681f4c0.wav",
+    "sha256": "3887c35c9b96d9063ad0b237ca9245a2abe930087fce47c2db074f9dc019a46e",
+    "duration": 1.034875
+  },
+  {
+    "sid": "C3-T3",
+    "index": 9,
+    "word": "demonstration",
+    "url": "clips_reviewed/C3-T3/0009-26fe072bf36c06c13314.wav",
+    "sha256": "c986a75b25483cea0604de93136b30abff08bada90e648a491b22a03878e16aa",
+    "duration": 1.1123125
+  }
+]

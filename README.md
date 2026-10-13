@@ -18,23 +18,33 @@
 
 ## 回归验证
 
-安装 Node.js 后，在仓库根目录运行 `node --test tests/review-regression.test.cjs`。测试直接提取并执行 `index.html` 中的交付模块，使用 Node 标准库与 VM，覆盖原八项审查及实际提交/恢复/故障编辑/跨章来源等 15 项核心案例；不依赖母仓源码、音频播放或额外包。`.github/workflows/node-regression.yml` 在 push main、PR 或手动触发时运行同一 Node 命令（contents:read，无部署）。本地命令已通过，新增 workflow 的云端执行结果请查看 Actions，勿将本地结果当作 CI 运行记录。
+Node 24：`node --test tests/review-regression.test.cjs`。24 项断言直接读取交付
+`index.html`，不依赖母仓源码或额外 Node 包。覆盖真实应用提交/恢复事件、
+跨章待确认与确定错误、最近错拼/CSV/TXT/队列、五条稳定旧原始行与未知累计、
+草稿双顺序重复恢复/刷新/导出再导入、来源 ID 碰撞、证据详情和混合掌握状态。
 
-### 真实 Chrome 验收
+## 自动 Chrome 验收
 
-在仓库外准备临时 QA 目录（Node 24、已安装 Google Chrome）：
+GitHub Actions 当前自动执行 24 项 Node 回归。7 组真实 Chrome 验收已在本地通过；
+纳入 CI 的工作流配置待同步，当前绿色 Actions 不代表 Chrome 已在云端执行。
+浏览器验收使用 Playwright 1.62.1 和 Google Chrome，运行
+`node tests/review-scope-browser.cjs index.html`，所有检查失败均返回非零状态。
+使用独立 context 和 preview 数据，不访问用户已有记录。
 
-```powershell
-mkdir dictation-qa
-cd dictation-qa
-npm init -y
-npm install --save-dev playwright
-$env:PLAYWRIGHT_PATH=(Resolve-Path ./node_modules/playwright).Path
-cd <本仓库路径>
-node tests/data-integrity-browser.cjs
-node tests/learning-browser.cjs
-```
+本地已安装 Chrome 时，可在仓库外安装 Playwright，并令 `PLAYWRIGHT_PATH`
+指向该模块目录，再执行同一浏览器命令；require('playwright') 正常可用时无需该变量。
+`tests/fixtures/` 的两段原 WAV 与发布清单逐字节校验并实际播放。
+这不是全部 5,570 段音频或其他浏览器的逐项验收。
+既有 `tests/data-integrity-browser.cjs` 和 `tests/learning-browser.cjs` 仍可手动运行。
 
-也可使用已有 Playwright（设置 PLAYWRIGHT_PATH），或让 require('playwright') 正常解析。无需安装生产依赖；两脚本默认读取相邻 index.html，也可传入其他 HTML 路径。使用独立浏览器 context 和 preview=1，不读取用户实际记录。前者验证实际提交、多轮/刷新、掌握失效、正确章节音频、双顺序/重复 JSON 恢复、配额失败后编辑与显式另存、首次掌握备份恢复；后者验证既有纸上、CSV/TXT、练习提交/重练和恢复。浏览器尚未配置为云端 CI。
+## 证据与恢复规则
 
-旧数据缺输入会影响覆盖率但不虚构错误。旧累计声明不当成已核实次数；新 evidence 容器随 JSON 保留。CSV 是查看导出，恢复仍仅 JSON。输入式连字符专项本轮暂缓，纸上连字符专项可用。
+- 证据详情分别列出确定错误、待核实来源、未验证旧累计；同一词存在两类证据时，
+  仅有效来源参与计数与复习。章节筛选、页面、导出和练习队列使用同一来源范围。
+- 具有稳定身份的内置旧原始行逐条计数；累计声明如 n=5 不会生成五次错误。
+  缺输入、身份内容冲突和无法排除重复的证据保留待核实。
+- 草稿只有原始 ID 或显式 importSourceId 能表明来源。不会从 -import-N 后缀推断身份。
+  无来源元数据的旧冲突副本保留为独立记录；第一次导入原始冲突备份可能新增一份
+  带明确来源的副本，后续重复恢复不会继续增加。不删除已有草稿来消除旧重复。
+- 标记掌握不清除原证据；恢复较旧备份不覆盖较新掌握操作，新确定错误会取消掌握。
+  CSV/TXT 用于查看，恢复只支持 JSON，完整备份保留原始答案与证据。

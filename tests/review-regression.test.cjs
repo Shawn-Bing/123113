@@ -5,7 +5,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const filename=process.env.RELEASE_HTML||process.argv[2]||[path.resolve(__dirname,'../index.html'),path.resolve(__dirname,'../_scratch/tmp/ielts-target-reference/index.html')].find(file=>fs.existsSync(file));
 assert.ok(filename,'Pass the generated index.html path or set RELEASE_HTML');
 const html=fs.readFileSync(filename,'utf8');
-function moduleCode(name){const escaped=name.replace(/[.*+?${}()|[\]\\]/g,'\\$&'),match=html.match(new RegExp('<!-- Inlined: '+escaped+' -->\\s*<script>\\s*([\\s\\S]*?)<\\/script>'));assert.ok(match,'Missing delivered module '+name);return match[1];}
+function moduleCode(name){const escaped=name.replace(/[.*+?${}()|[\]\\]/g,'\\$&'),match=html.match(new RegExp('<!-- Inlined: '+escaped+' -->\\s*<script>\\s*([\\s\\S]*?)<\\/script>'));if(match)return match[1];assert.ok(html.includes('src="'+name+'"'),'Missing delivered module '+name);return fs.readFileSync(path.join(path.dirname(filename),name),'utf8');}
 function environment(){const context={console,URL,URLSearchParams};context.window=context;vm.createContext(context);for(const name of ['data/words.js','data/rules.js','core.js','wrong-frequency.js','dictation-features.js','learning-insights.js'])vm.runInContext(moduleCode(name),context,{filename:name});return context;}
 const scope=environment(),C=scope.DictationCore,W=scope.DictationWrongFrequency,R=scope.DICT_RULES,S={ignoreCase:true,looseRules:true},plain=value=>JSON.parse(JSON.stringify(value));
 const row=(w,input,index=0)=>({w,in:input,sid:'C3-T1',index}),rec=(id,rows,ts=100)=>({id,sid:'C3-T1',mode:'dictation',ts,ms:1,rows});
@@ -17,7 +17,7 @@ function app(storage={},hash='#wrong',options={}){
  context.document={documentElement:{...element(),style:{setProperty(){},removeProperty(){}}},body:{classList:classes,appendChild(){}},querySelector:key=>nodes[key]||null,querySelectorAll:selector=>selector==='[data-answer]'?answers:[],activeElement:null,visibilityState:'visible',hidden:false,createElement(){const input={...element(),click(){}};nodes['file-input']=input;return input;},addEventListener:(name,fn)=>handlers[name]=fn};
  context.location={hash,search:'',protocol:'file:',href:'file:///review/index.html',hostname:''};context.Audio=class{setAttribute(){}pause(){}load(){}addEventListener(){}removeEventListener(){}play(){return Promise.resolve();}};
  context.localStorage={getItem:key=>memory.get(key)||null,setItem:(key,value)=>{if(options.failWrite?.(key,value))throw Error('injected quota');memory.set(key,value);}};context.setTimeout=()=>1;context.clearTimeout=()=>{};context.setInterval=()=>1;context.clearInterval=()=>{};context.addEventListener=(name,fn)=>events[name]=fn;context.scrollTo=()=>{};context.innerHeight=720;context.scrollY=0;
- const hooks='window.__review={paperItems,currentWrong,currentRecords,get session(){return session;},setDownload(callback){download=callback;}};';
+ const hooks='window.__review={paperItems,answerEntries,filteredReviewItems,filteredWrong,currentWrong,currentRecords,get session(){return session;},setDownload(callback){download=callback;}};';
  vm.runInContext(moduleCode('app.js').replace('  settings = sanitizeSettings(settings);',hooks+'\n  settings = sanitizeSettings(settings);'),context,{filename:'delivered-app.js'});
  const click=async(act,extra={})=>{const target={dataset:{act,...extra},classList:classes,closest(){return this;}};await handlers.click({target});};return {context,root,modal,memory,click,events,nodes,handlers,input(index,value){const target=nodes['[data-answer="'+index+'"]'];assert.ok(target,'actual input rendered');target.value=value;handlers.input({target,isComposing:false});},api:context.__review};
 }
@@ -76,4 +76,101 @@ test('14 actual shipped history-only master export restores the new container in
 });
 test('15 actual shipped all/chapter playback buttons use one original sid/index pair',async()=>{
  const items=['C11-T1','C3-T3'].map(sid=>deliveredItem('demonstration',sid)),h=app({dict2_records:[rec('both-play',items.map(item=>({...item,in:'demonstratiom'})))]});for(const sid of ['all','C11-T1','C3-T3']){h.handlers.change({target:{id:'wrong-chapter',value:sid,dataset:{},classList:{contains(){return false;}}}});const match=h.root.innerHTML.match(/aria-label="播放 demonstration" data-act="speak" data-sid="([^"]+)" data-index="([0-9]+)"/);assert.ok(match);assert.equal(scope.DICT_DATA.words[match[1]][Number(match[2])].w,'demonstration');if(sid!=='all')assert.equal(match[1],sid);}
+});
+
+const chooseChapter=(h,sid)=>h.handlers.change({target:{id:'wrong-chapter',value:sid,dataset:{},classList:{contains(){return false;}}}});
+async function restoreBackup(h,backup){await h.click('restore');const input=h.nodes['file-input'];input.files=[{text:async()=>JSON.stringify(backup)}];await input.onchange();assert.match(h.nodes['#toast'].textContent,/已合并恢复/);}
+const draftFixture=(id,input,extra={})=>({id,sid:'C11-T1',mode:'dictation',order:'normal',items:[deliveredItem('demonstration','C11-T1')],inputs:[input],states:[''],idx:0,elapsed:10,...extra});
+
+test('16 mixed pending/confirmed chapters keep status, queue, display and CSV scoped',async()=>{
+ const confirmed=deliveredItem('demonstration','C11-T1'),pending=deliveredItem('demonstration','C3-T3');
+ const h=app({dict2_records:[rec('confirmed',[{...confirmed,in:'demonstratiom'}])],dict2_wrong:{demonstration:{sid:pending.sid,index:pending.index,n:5,ts:200}}});
+ assert.match(h.root.innerHTML,/另有待确认旧证据/);assert.equal(h.api.filteredReviewItems().length,1);
+ chooseChapter(h,pending.sid);assert.equal(h.api.filteredReviewItems().length,0);assert.match(h.root.innerHTML,/data-act="review-all" disabled/);
+ await h.click('wrong-filter',{value:'uncertain'});const view=h.api.filteredWrong()[0][1];assert.equal(view.pending,true);assert.equal(view.n,0);assert.equal(view.in,undefined);
+ let csv;h.api.setDownload((name,text)=>csv=text);await h.click('export-wrong');assert.match(csv,/C3-T3/);assert.ok(!csv.includes('demonstratiom'));assert.ok(!csv.includes('C11-T1'));
+ await h.click('review-all');assert.equal(h.modal.innerHTML,'');assert.equal(h.api.paperItems().length,1,'all-errors paper queue only has the confirmed chapter');
+ assert.equal(h.api.answerEntries('filtered').length,0);
+ await h.click('paper-option',{key:'source',value:'filtered'});await h.click('paper-option',{key:'dedupe',value:'false'});assert.equal(h.api.paperItems().length,0);
+ chooseChapter(h,confirmed.sid);await h.click('wrong-filter',{value:'pending'});assert.equal(h.api.filteredReviewItems()[0].sid,confirmed.sid);assert.equal(h.api.filteredWrong()[0][1].hasPending,false);assert.equal(h.api.answerEntries('filtered')[0].sid,confirmed.sid);
+});
+
+test('17 chapter latest typo, error count and export share the selected scope',async()=>{
+ const a=deliveredItem('demonstration','C11-T1'),b=deliveredItem('demonstration','C3-T3');
+ const h=app({dict2_records:[rec('older',[{...a,in:'demonstratiom'}],100),rec('newer',[{...b,in:'demonstartion'}],200)]});
+ chooseChapter(h,a.sid);let csv;h.api.setDownload((name,text)=>csv=text);await h.click('export-wrong');
+ assert.equal(h.api.filteredWrong()[0][1].in,'demonstratiom');assert.match(h.root.innerHTML,/demonstratiom/);assert.ok(!h.root.innerHTML.includes('demonstartion'));
+ assert.ok(csv.includes('demonstratiom'));assert.ok(!csv.includes('demonstartion'));assert.equal(h.api.currentWrong().demonstration.in,'demonstartion');
+ await h.click('wrong-evidence',{word:a.w});assert.ok(!h.modal.innerHTML.includes('demonstartion'));
+});
+
+test('18 unresolvable vocabulary and uncertain links cannot enable an empty review',async()=>{
+ const h=app({dict2_wrong:{'removed word':{sid:'C11-T1',index:-1,n:1,in:'typo'}}});
+ assert.equal(h.api.filteredWrong().length,1);assert.equal(h.api.filteredReviewItems().length,0);assert.match(h.root.innerHTML,/data-act="review-all" disabled/);
+});
+
+test('19 colliding drafts restore idempotently in both orders, from active/saved/old suffix versions',async()=>{
+ const a=draftFixture('r100','local'),b=draftFixture('r100','imported'),backup=value=>({records:[],wrong:{},draft:value,drafts:[value]});
+ for(const [first,second] of [[a,b],[b,a]])for(const active of [true,false]){
+  const h=app(active?{dict3_draft:first}:{dict3_saved_drafts:[first]});await restoreBackup(h,backup(second));
+  const once=h.memory.get('dict3_saved_drafts');for(let i=0;i<4;i++)await restoreBackup(h,backup(second));assert.equal(h.memory.get('dict3_saved_drafts'),once);
+  assert.equal(storedValue(h,'dict3_saved_drafts').length,active?1:2);if(active)assert.deepEqual(storedValue(h,'dict3_draft'),plain(first));
+  const exported={records:[],wrong:{},draft:active?first:null,drafts:storedValue(h,'dict3_saved_drafts')},fresh=app();await restoreBackup(fresh,exported);await restoreBackup(fresh,backup(second));assert.equal(storedValue(fresh,'dict3_saved_drafts').length,2);
+ }
+ const migrated=app({dict3_draft:a,dict3_saved_drafts:[{...b,id:'r100-import-1'}]});await restoreBackup(migrated,backup(b));assert.equal(storedValue(migrated,'dict3_saved_drafts').length,2,'unproven old suffix must be preserved as a separate source');
+ const stable=migrated.memory.get('dict3_saved_drafts');await restoreBackup(migrated,backup(b));assert.equal(migrated.memory.get('dict3_saved_drafts'),stable);
+ await restoreBackup(migrated,backup({...b,id:'unrelated'}));assert.equal(storedValue(migrated,'dict3_saved_drafts').length,3,'same content with a different source is retained');
+ await restoreBackup(migrated,backup({...b,order:'shuffle'}));assert.equal(storedValue(migrated,'dict3_saved_drafts').length,4,'different content is retained');
+});
+
+test('20 actual legacy import counts distinct original rows and keeps repeated restoration stable',async()=>{
+ const h=app(),item=deliveredItem('demonstration','C3-T3');h.context.DICT_LEGACY_RECORDS={[item.sid]:Array.from({length:5},()=>({w:item.w,in:'demonstartion'}))};
+ await h.click('legacy');assert.equal(h.api.currentWrong().demonstration.n,5);await h.click('legacy');assert.equal(h.api.currentWrong().demonstration.n,5);
+ await h.click('paper-option',{key:'dedupe',value:'false'});assert.equal(h.api.paperItems().length,5);
+ const backup={records:[],wrong:storedValue(h,'dict2_wrong')};await restoreBackup(h,backup);const once=h.memory.get('dict2_wrong');await restoreBackup(h,backup);assert.equal(h.memory.get('dict2_wrong'),once);
+});
+
+const evidenceRegion=(h,name)=>{const match=h.modal.innerHTML.match(new RegExp('<section data-evidence-group="'+name+'">([\\s\\S]*?)</section>'));assert.ok(match,'missing evidence region '+name);return match[1];};
+test('21 mixed evidence details separate counted errors, unresolved sources and old cumulative claims',async()=>{
+ const a=deliveredItem('demonstration','C11-T1'),b=deliveredItem('demonstration','C3-T3');
+ const h=app({dict2_records:[rec('certain',[{...a,in:'demonstratiom'}])],dict2_wrong:{demonstration:{sid:b.sid,index:b.index,n:5}}});
+ await h.click('wrong-evidence',{word:a.w});
+ assert.match(evidenceRegion(h,'confirmed'),/确定错误 · 1 次/);assert.match(evidenceRegion(h,'confirmed'),/demonstratiom/);assert.ok(!evidenceRegion(h,'confirmed').includes(b.sid));
+ assert.match(evidenceRegion(h,'unresolved'),/待核实来源 · 1 条/);assert.match(evidenceRegion(h,'unresolved'),/缺少原始输入/);assert.ok(!evidenceRegion(h,'unresolved').includes(a.sid));
+ assert.match(evidenceRegion(h,'cumulative'),/5 次（未验证）/);assert.match(h.modal.innerHTML,/另有待核实证据/);assert.equal(h.api.filteredReviewItems().length,1);
+ chooseChapter(h,a.sid);await h.click('wrong-evidence',{word:a.w});assert.match(evidenceRegion(h,'unresolved'),/待核实来源 · 0 条/);assert.ok(!h.modal.innerHTML.includes(b.sid));
+ chooseChapter(h,b.sid);await h.click('wrong-filter',{value:'uncertain'});await h.click('wrong-evidence',{word:a.w});assert.match(evidenceRegion(h,'confirmed'),/确定错误 · 0 次/);assert.equal(h.api.filteredReviewItems().length,0);
+});
+
+test('22 genuine original suffix IDs and explicit renamed imports never consume each other',async()=>{
+ const backup=draft=>({records:[],wrong:{},draft});
+ for(const id of ['r100-import-1','r100-import-1-import-2'])for(const reversed of [false,true]){
+  const values=[draftFixture('r100','same'),draftFixture(id,'same')];if(reversed)values.reverse();
+  const h=app({dict3_draft:values[0]});await restoreBackup(h,backup(values[1]));assert.equal(storedValue(h,'dict3_saved_drafts').length,1);assert.equal(storedValue(h,'dict3_saved_drafts')[0].id,values[1].id);
+  const once=h.memory.get('dict3_saved_drafts');await restoreBackup(h,backup(values[1]));assert.equal(h.memory.get('dict3_saved_drafts'),once);
+ }
+ const imported=draftFixture('r100-import-1','same',{importSourceId:'r100'}),h=app({dict3_saved_drafts:[imported]});
+ await restoreBackup(h,backup(draftFixture('r100','same')));assert.equal(storedValue(h,'dict3_saved_drafts').length,1);
+ await restoreBackup(h,backup(draftFixture('r100-import-1','same')));const saved=storedValue(h,'dict3_saved_drafts');assert.equal(saved.length,2);assert.equal(saved[1].importSourceId,'r100-import-1');
+ const once=h.memory.get('dict3_saved_drafts');await restoreBackup(h,backup(draftFixture('r100-import-1','same')));assert.equal(h.memory.get('dict3_saved_drafts'),once);
+});
+
+test('23 stable old rows, aliases, unknown cumulative snapshots and conflicting versions obey distinct identity rules',()=>{
+ const item=deliveredItem('demonstration','C3-T3'),snapshot=(ordinal,input='demonstartion')=>({word:item.w,sid:item.sid,index:item.index,hasInput:true,in:input,n:1,sourceId:C.stableJSON(['bundled-legacy-records',item.sid,ordinal,item.w,input])});
+ const derive=snapshots=>C.deriveWrong([],{[item.w]:{...C.evidenceEntry(item.w),legacySnapshots:Object.fromEntries(snapshots.map((v,i)=>[i,v]))}},R)[item.w];
+ const rows=Array.from({length:5},(_,i)=>snapshot(i));assert.equal(derive(rows).n,5);assert.equal(derive([...rows,rows[0]]).n,5);
+ assert.equal(derive(rows.map((value,i)=>({...value,sourceId:'unknown-'+i,n:5}))).n,1);
+ assert.equal(derive([{...rows[0],hasInput:false,in:undefined,n:5}]).n,0);
+ const conflict=derive([snapshot(0),snapshot(0,'demonstratiom')]);assert.equal(conflict.n,0);assert.equal(conflict.pending,true);
+ const aliased=derive([rows[0],{...rows[0],sourceId:undefined,n:5}]);assert.equal(aliased.n,1);assert.equal(aliased.hasPending,true);
+});
+
+test('24 manual, historical and pending evidence preserve mastery through restore and invalidate it only on a new error',async()=>{
+ const a=deliveredItem('demonstration','C11-T1'),b=deliveredItem('demonstration','C3-T3'),history=rec('before-mastery',[{...a,in:'demonstratiom'}]);
+ const initial=C.mutateWrong({[a.w]:{sid:b.sid,index:b.index,n:5}},{type:'manual',items:[b],now:100});
+ const h=app({dict2_records:[history],dict2_wrong:plain(initial)});assert.equal(h.api.filteredReviewItems().length,2);assert.equal(h.api.currentWrong()[a.w].hasPending,true);assert.equal(h.api.currentWrong()[a.w].n,1);
+ await h.click('master',{word:a.w});const mastered=storedValue(h,'dict2_wrong');await restoreBackup(h,{records:[history],wrong:plain(initial)});assert.deepEqual(storedValue(h,'dict2_wrong').demonstration.mastery,mastered.demonstration.mastery);assert.equal(h.api.filteredReviewItems().length,0);
+ chooseChapter(h,b.sid);await h.click('wrong-filter',{value:'mastered'});assert.equal(h.api.filteredWrong()[0][1].manual,true);await h.click('wrong-evidence',{word:a.w});assert.match(h.modal.innerHTML,/已掌握（保留）/);assert.match(evidenceRegion(h,'confirmed'),/手动标记可用于复习，不增加错误次数/);assert.match(evidenceRegion(h,'unresolved'),/缺少原始输入/);
+ const changed=await deliveredCommit([a],['demonstrationn'],{dict2_records:[history],dict2_wrong:storedValue(h,'dict2_wrong')},'after-mastery');
+ assert.equal(changed.api.currentWrong()[a.w].mastered,false);assert.equal(changed.api.currentWrong()[a.w].n,2);assert.equal(changed.api.currentWrong()[a.w].hasPending,true);assert.equal(Object.keys(storedValue(changed,'dict2_wrong').demonstration.manualSources).length,1);
 });
