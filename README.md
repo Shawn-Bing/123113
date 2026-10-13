@@ -25,11 +25,10 @@ Node 24：`node --test tests/review-regression.test.cjs`。24 项断言直接读
 
 ## 自动 Chrome 验收
 
-GitHub Actions 当前自动执行 24 项 Node 回归。7 组真实 Chrome 验收已在本地通过；
-纳入 CI 的工作流配置待同步，当前绿色 Actions 不代表 Chrome 已在云端执行。
-浏览器验收使用 Playwright 1.62.1 和 Google Chrome，运行
-`node tests/review-scope-browser.cjs index.html`，所有检查失败均返回非零状态。
-使用独立 context 和 preview 数据，不访问用户已有记录。
+`.github/workflows/node-regression.yml` 在 main push、PR 和手动触发时，
+先跑 24 项 Node 回归，再安装固定 Playwright 1.62.1 和 Google Chrome，
+运行 `node tests/review-scope-browser.cjs index.html`。7 组浏览器检查均为硬性通过条件。
+使用独立 context 和 preview 数据，不访问用户已有记录。CI 保留 JSON 结果和证据截图。
 
 本地已安装 Chrome 时，可在仓库外安装 Playwright，并令 `PLAYWRIGHT_PATH`
 指向该模块目录，再执行同一浏览器命令；require('playwright') 正常可用时无需该变量。

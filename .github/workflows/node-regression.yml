@@ -1,4 +1,4 @@
-name: Delivered HTML regression
+name: Delivered HTML and Chrome regression
 on:
   push:
     branches: [main]
@@ -11,17 +11,33 @@ permissions:
 jobs:
   regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
           sparse-checkout: |
             /index.html
-            /tests/*.test.cjs
+            /tests/
           sparse-checkout-cone-mode: false
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           package-manager-cache: false
       - run: node --test tests/review-regression.test.cjs
+      - name: Install pinned Playwright and Chrome
+        run: |
+          npm install --prefix "$RUNNER_TEMP/review-qa" --no-save --package-lock=false playwright@1.62.1
+          node "$RUNNER_TEMP/review-qa/node_modules/playwright/cli.js" install --with-deps chrome
+      - name: Chrome submission, filtering and repeated restore
+        env:
+          PLAYWRIGHT_PATH: ${{ runner.temp }}/review-qa/node_modules/playwright
+          REVIEW_BROWSER_OUTPUT: ${{ runner.temp }}/review-artifacts
+        run: node tests/review-scope-browser.cjs index.html
+      - name: Preserve Chrome evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-browser-evidence
+          path: ${{ runner.temp }}/review-artifacts
+          if-no-files-found: ignore
