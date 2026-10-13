@@ -2225,7 +2225,19 @@ button.heat-cell:hover { transform:translateY(-1px); box-shadow:0 0 0 2px #8c77d
 @media(max-width:600px){.frequency-summary{padding:15px}.wrong-toolbar>.segmented{max-width:100%;flex-wrap:wrap}.wrong-toolbar>.row{width:100%;min-width:0;flex-wrap:wrap}.wrong-toolbar>.row>.select,.wrong-toolbar>.row>.search{flex:1 1 160px;min-width:0;max-width:100%}.frequency-table th,.frequency-table td{padding:13px 12px}}
 
 </style>
-  </head>
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+</head>
 <body>
   <div id="app"></div>
   <div id="modal-root"></div>
@@ -2583,35 +2595,63 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       known.set(record.id,record);result.push(record);
     }return result;
   }
+  // Only the bundled XLSX row identity proves a distinct old answer. Arbitrary
+  // snapshot keys/sourceId values and cumulative n do not prove attempt counts.
+  function legacyRowId(snapshot) {
+    try {
+      const id=JSON.parse(snapshot.sourceId);
+      return snapshot.hasInput&&snapshot.n===1&&Array.isArray(id)&&id.length===5&&id[0]==='bundled-legacy-records'&&id[1]===snapshot.sid&&Number.isInteger(id[2])&&id[2]>=0&&id[3]===snapshot.word&&id[4]===snapshot.in ? stableJSON(id.slice(0,4)) : null;
+    } catch { return null; }
+  }
+  function projectWrong(entry, sid='all') {
+    const sources=(entry.sources||[]).filter(source=>sid==='all'||source.sid===sid);
+    if(!sources.length)return null;
+    const n=sources.reduce((sum,source)=>sum+source.n,0),manual=sources.some(source=>source.manual);
+    const occurrences=sources.flatMap(source=>source.occurrences||[]);
+    const valid=occurrences.filter(value=>value.type==='history'||value.state==='independent');
+    const latest=valid.slice().sort((a,b)=>(a.ts??-Infinity)-(b.ts??-Infinity)||(a.recordId&&a.recordId===b.recordId?a.rowIndex-b.rowIndex:0)||String(a.occurrenceId).localeCompare(String(b.occurrenceId))).at(-1);
+    const first=latest||sources.find(source=>source.n||source.manual)||sources[0];
+    const unresolved=occurrences.filter(value=>['missing-input','unresolved-link','conflicting-source'].includes(value.state));
+    const legacyCount=Math.max(0,...sources.map(source=>source.legacyCount||0));
+    return {...entry,sources,sid:first.sid,index:first.index,in:latest?.input,ts:latest?.ts,n,manual,
+      pending:!n&&!manual,hasPending:unresolved.length>0||sources.some(source=>source.pending),
+      legacyCount:legacyCount||undefined,legacyPending:Math.max(0,legacyCount-1),legacyEvidence:unresolved[0]||valid.find(value=>value.type==='legacy')};
+  }
   function deriveWrong(records,stored={},rules={}) {
     const history=historyViews(records,rules),words=new Set(Object.keys(stored)),byWord=new Map(),result=Object.create(null);
     for(const record of history)if(['normal','dictation','shuffle','wrong'].includes(record.mode))record.rows.forEach((row,rowIndex)=>{
       if(typeof row.w!=='string')return;words.add(row.w);if(!byWord.has(row.w))byWord.set(row.w,[]);byWord.get(row.w).push({recordId:record.id,rowIndex,sid:row.sid||record.sid,index:row.index,input:row.in,ts:record.ts,correct:row.correct,occurrenceId:referenceId(record.id,rowIndex)});
     });
     for(const word of words){
-      const saved=Object.hasOwn(stored,word)?stored[word]:{},entry=evidenceEntry(word,saved),rows=byWord.get(word)||[],errors=rows.filter(v=>v.correct===false),sources=new Map(),legacy=[],unresolved=[];let legacyCount=0,missing=false;
+      const saved=Object.hasOwn(stored,word)?stored[word]:{},entry=evidenceEntry(word,saved),rows=byWord.get(word)||[],errors=rows.filter(v=>v.correct===false),sources=new Map(),legacy=[],unresolved=[];let missing=false;
       const sourceFor=value=>{const id=stableJSON([value.sid,value.index,word]);if(!sources.has(id))sources.set(id,{sid:value.sid,index:value.index,w:word,n:0,occurrences:[],pending:false,manual:false});return sources.get(id);};
       for(const row of errors){const source=sourceFor(row);source.n++;source.occurrences.push({...row,type:'history'});}
       let matched=false;
+      const identified=new Set(),rowInputs=new Map();
+      for(const snapshot of Object.values(entry.legacySnapshots)){const id=legacyRowId(snapshot);if(id){if(!rowInputs.has(id))rowInputs.set(id,new Set());rowInputs.get(id).add(snapshot.in);}}
       for(const [id,snapshot]of Object.entries(entry.legacySnapshots||{})){
-        legacyCount=Math.max(legacyCount,Number.isFinite(snapshot.n)?snapshot.n:0);const source=sourceFor(snapshot);
-        if(!snapshot.hasInput||typeof snapshot.in!=='string'){missing=true;source.pending=true;unresolved.push({...snapshot,id,state:'missing-input'});continue;}
+        const source=sourceFor(snapshot);
+        if(!legacyRowId(snapshot))source.legacyCount=Math.max(source.legacyCount||0,snapshot.n||0);
+        if(!snapshot.hasInput||typeof snapshot.in!=='string'){missing=true;source.pending=true;const value={...snapshot,id,state:'missing-input',type:'legacy',occurrenceId:'legacy:'+id};unresolved.push(value);source.occurrences.push(value);continue;}
+        const rowId=legacyRowId(snapshot);
+        if(rowId&&rowInputs.get(rowId).size>1){source.pending=true;const value={...snapshot,id,state:'conflicting-source',type:'legacy',occurrenceId:'legacy:'+id};unresolved.push(value);source.occurrences.push(value);continue;}
         if(scoreGrade(snapshot.in,word,{ignoreCase:true,looseRules:true},rules).correct)continue;
+        if(rowId&&identified.has(rowId))continue;if(rowId)identified.add(rowId);
         const matches=rows.filter(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.evidence?row.recordId===snapshot.evidence.recordId&&row.rowIndex===snapshot.evidence.rowIndex:Number.isFinite(snapshot.ts)&&row.ts===snapshot.ts&&Number.isInteger(snapshot.index)&&row.index===snapshot.index));
         if(matches.length===1){matched=true;continue;}
-        const possible=errors.some(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.index===undefined||row.index===snapshot.index));
-        const value={...snapshot,id,state:possible?'unresolved-link':'independent'};source.occurrences.push({...value,input:snapshot.in,occurrenceId:'legacy:'+id,type:'legacy'});
+        const possible=errors.some(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.index===undefined||row.index===snapshot.index))||!rowId&&Object.values(entry.legacySnapshots).some(other=>legacyRowId(other)&&other.sid===snapshot.sid&&other.index===snapshot.index&&other.in===snapshot.in);
+        const value={...snapshot,id,state:possible?'unresolved-link':'independent',input:snapshot.in,occurrenceId:'legacy:'+(rowId||id),type:'legacy',counted:false};source.occurrences.push(value);
+        if(possible)source.pending=true;
         (possible?unresolved:legacy).push(value);
       }
-      // Unknown legacy cumulative declarations never add up to invented historical events.
-      // At most one independently evidenced old error contributes beyond complete raw rows.
-      if(legacy.length){const snapshot=legacy.slice().sort((a,b)=>(b.ts||0)-(a.ts||0)||a.id.localeCompare(b.id))[0];sourceFor(snapshot).n++;}
+      // Distinct bundled rows each count once. Unidentified cumulative snapshots
+      // establish at most one additional old error per original question source.
+      const cumulative=new Set();
+      for(const snapshot of legacy.slice().sort((a,b)=>(b.ts||0)-(a.ts||0)||a.id.localeCompare(b.id))){const source=sourceFor(snapshot);if(legacyRowId(snapshot)){source.n++;snapshot.counted=true;}else if(!cumulative.has(source)){source.n++;snapshot.counted=true;cumulative.add(source);}}
       for(const source of Object.values(entry.manualSources||{})){const item=sourceFor(source);item.manual=true;}
-      const n=errors.length+(legacy.length?1:0),manual=[...sources.values()].some(v=>v.manual),pending=!n&&!manual&&missing;
+      const n=[...sources.values()].reduce((sum,source)=>sum+source.n,0),manual=[...sources.values()].some(v=>v.manual),pending=!n&&!manual&&missing;
       if(!n&&!manual&&!pending&&!unresolved.length)continue;
-      const latest=errors.slice().sort((a,b)=>a.ts-b.ts).at(-1)||legacy[0]||unresolved[0]||{},mastered=!!entry.mastery?.value;
-      result[word]={...saved,sid:latest.sid||saved.sid,index:latest.index??saved.index,in:latest.input??latest.in??saved.in,ts:latest.ts??saved.ts,n,mastered,manual,pending:pending||!n&&!manual,legacyCount:legacyCount||undefined,legacyPending:Math.max(0,legacyCount-1),sources:[...sources.values()].filter(v=>v.n||v.manual||v.pending||v.occurrences.length),provenance:{historyErrors:errors.length,legacy:unresolved.some(v=>v.state==='unresolved-link')?'unresolved-link':legacy.length?'independent':missing?'missing-input':matched?'matched':manual?'manual':'none'}};
-      const extra=unresolved[0]||legacy[0];if(extra)result[word].legacyEvidence=extra;
+      result[word]=projectWrong({...saved,mastered:!!entry.mastery?.value,sources:[...sources.values()].filter(v=>v.n||v.manual||v.pending||v.occurrences.length),provenance:{historyErrors:errors.length,legacy:unresolved.some(v=>v.state==='conflicting-source')?'conflicting-source':unresolved.some(v=>v.state==='unresolved-link')?'unresolved-link':legacy.length?'independent':missing?'missing-input':matched?'matched':manual?'manual':'none'}});
     }
     return result;
   }
@@ -2729,7 +2769,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return { total: data.words[sid]?.length || 0, practiced: practiced.size,
       attempts: history.length, last: history.at(-1) || null, drafts: saved };
   }
-  return { validWrongEntry,evidenceEntry,mergeEvidence,mutateWrong,mergeRecords,referenceId,stableJSON,sourceRecord,originalImmediate,ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
+  return { projectWrong,legacyRowId,validWrongEntry,evidenceEntry,mergeEvidence,mutateWrong,mergeRecords,referenceId,stableJSON,sourceRecord,originalImmediate,ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
 });
 
 </script>
@@ -2963,9 +3003,9 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function retryItems(data, entries) {
     const seen=new Set(),items=[];
     for(const [word,info]of entries)for(const source of info.sources?.length?info.sources:[info]){
-      if(source.pending&&!source.n&&!source.manual)continue;
+      if(info.sources?.length ? !source.n&&!source.manual : source.pending&&!source.n&&!source.manual)continue;
       const words=data.words[source.sid]||[],index=Number.isInteger(source.index)&&(words[source.index]?.w===word||words[source.index]?.previousWords?.includes(word))?source.index:words.findIndex(item=>item.w===word),id=JSON.stringify([source.sid,index]);
-      if(index<0||seen.has(id))continue;seen.add(id);items.push({...words[index],sid:source.sid,index,sourceOccurrences:source.occurrences||[]});
+      if(index<0||seen.has(id))continue;seen.add(id);items.push({...words[index],sid:source.sid,index,sourceOccurrences:(source.occurrences||[]).filter(value=>value.type!=='legacy'||value.counted)});
     }return items;
   }
   function paperQueue(items, options = {}, random = Math.random) {
@@ -3358,7 +3398,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function wrongPage() {
     const frequent = wrongFilter === 'frequency', frequency = filteredFrequency();
-    const reviewCount=frequent?W.practiceItems(D,frequency).length:filteredWrong().filter(([,w])=>!w.mastered&&!w.pending).length;
+    const reviewCount=frequent?W.practiceItems(D,frequency).length:filteredReviewItems().length;
     return heading('错词复习', '把不熟悉的，再听一次。每个错词都是进步的起点。', button('听音默写','paper-setup','','primary') + button('正确答案 TXT','answers-txt') + button(icon('download', 15) + (frequent ? ' 导出统计' : ' 导出错词'), frequent ? 'export-frequency' : 'export-wrong')) +
       `<div class="wrong-banner panel">${icon('edit', 30)}<div class="grow"><h2>${wrongBannerTitle()}</h2><p>${frequent ? '单词与词组中的同一错词合并累计；可查看来源并复习对应原词条。' : '听写结束后自动收录错词，支持按章节复习与标记掌握。'}</p></div>${button(icon('play', 14) + (frequent ? ' 按高频复习' : ' 开始复习'), 'review-all', reviewCount ? '' : 'disabled', 'primary')}</div><div class="toolbar wrong-toolbar"><div class="segmented" aria-label="错词状态">${[['pending','待复习'],['uncertain','待确认'],['mastered','已掌握'],['frequency','高频错词']].map(([v, label]) => `<button class="${wrongFilter === v ? 'active' : ''}" data-act="wrong-filter" data-value="${v}">${label} <small data-wrong-count="${v}">${v==='frequency'?filteredFrequency().length:wrongEntries(v).length}</small></button>`).join('')}</div><div class="row"><select class="select" id="wrong-chapter" aria-label="筛选错词章节"><option value="all">全部章节</option>${sections.map(s => `<option value="${s.id}" ${wrongChapter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select><label class="search">${icon('search', 14)}<input id="wrong-search" value="${esc(wrongSearch)}" placeholder="搜索单词…" aria-label="搜索错词"></label></div></div><div id="wrong-list">${wrongTable()}</div><div id="word-profiles">${profileTable()}</div>`;
   }
@@ -3369,7 +3409,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function paperItems() {
     if(paperOptions.source==='hyphen')return sections.filter(s=>wrongChapter==='all'||s.id===wrongChapter).flatMap(s=>C.itemsFor(D,s.id)).filter(item=>C.normalize(item.w).includes('-'));
     if(paperOptions.source==='latest') {const last=records.filter(r=>['normal','dictation','shuffle','wrong'].includes(r.mode)).slice().sort((a,b)=>b.ts-a.ts)[0];return last?C.retryItems(D,C.recordView(last,RULES)):[];}
-    if(paperOptions.source==='filtered') return wrongFilter==='frequency'?W.practiceItems(D,filteredFrequency(),{dedupe:paperOptions.dedupe}):paperReviewItems(filteredWrong());
+    if(paperOptions.source==='filtered') return wrongFilter==='frequency'?W.practiceItems(D,filteredFrequency(),{dedupe:paperOptions.dedupe}):wrongFilter==='uncertain'?[]:paperReviewItems(filteredWrong());
     if(paperOptions.source==='repeat') return W.practiceItems(D,frequencyStats().filter(e=>e.n>=2),{dedupe:paperOptions.dedupe});
     if(['same-typo','round-unstable','history-mixed','spelling-unstable','long-fixed','long-unstable'].includes(paperOptions.source))return W.practiceItems(D,W.reviewProfiles(allProfiles(),paperOptions.source),{dedupe:paperOptions.dedupe});
     return paperReviewItems(Object.entries(currentWrong()).filter(([,v])=>!v.mastered&&!v.pending));
@@ -3377,8 +3417,10 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function paperReviewItems(entries){
     entries=entries.filter(([,v])=>!v.pending);if(paperOptions.dedupe)return F.retryItems(D,entries);
     const items=[],seen=new Set();for(const [word,entry]of entries)for(const source of entry.sources||[]){
-      const occurrences=source.occurrences?.length?source.occurrences:[{occurrenceId:'source:'+C.stableJSON([source.sid,source.index,word]),...source}];
-      for(const occurrence of occurrences){if(occurrence.type==='legacy'&&occurrence.state==='unresolved-link')continue;const id=occurrence.occurrenceId;if(seen.has(id))continue;const item=C.itemForRow(D,{w:word,sid:source.sid,index:source.index},source.sid);if(item){seen.add(id);items.push({...item,recordId:occurrence.recordId,rowIndex:occurrence.rowIndex,occurrenceId:id});}}
+      if(!source.n&&!source.manual)continue;
+      const eligible=(source.occurrences||[]).filter(value=>value.type!=='legacy'||value.counted);
+      const occurrences=eligible.length?eligible:source.manual?[{occurrenceId:'source:'+C.stableJSON([source.sid,source.index,word]),...source}]:[];
+      for(const occurrence of occurrences){if(occurrence.type==='legacy'&&!occurrence.counted)continue;const id=occurrence.occurrenceId;if(seen.has(id))continue;const item=C.itemForRow(D,{w:word,sid:source.sid,index:source.index},source.sid);if(item){seen.add(id);items.push({...item,recordId:occurrence.recordId,rowIndex:occurrence.rowIndex,occurrenceId:id});}}
     }return items;
   }
   function startPaper(resume=false) {
@@ -3405,13 +3447,14 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     save('paper',paper.state);$('#paper-stage').innerHTML=paperStage(paper.state);
   }
   function wrongBannerTitle(){const count=wrongFilter==='frequency'?filteredFrequency().length:filteredWrong().length;return wrongFilter==='uncertain'?`${count} 条旧记录待确认。`:wrongFilter==='mastered'?`${count} 个词条保留已掌握标记。`:wrongFilter==='frequency'?`找到 ${count} 个高频错词，按错误次数逐个巩固。`:count?`还有 ${count} 个单词，值得再练一次。`:'今天，从熟悉一个新单词开始。';}
-  function wrongEntries(group=wrongFilter){return Object.entries(currentWrong()).map(([word,value])=>{if(wrongChapter==='all')return [word,value];const sources=(value.sources||[]).filter(source=>source.sid===wrongChapter);if(!sources.length)return [word,null];const first=sources.find(source=>source.n)||sources[0];return [word,{...value,sources,sid:first.sid,index:first.index,n:sources.reduce((n,source)=>n+source.n,0)}];}).filter(([,value])=>value).filter(([word,w])=>(group==='uncertain'?w.pending:group==='mastered'?w.mastered&&!w.pending:!w.mastered&&!w.pending)&&C.fold(word).includes(C.fold(wrongSearch))).sort((a,b)=>b[1].n-a[1].n);}
+  function wrongEntries(group=wrongFilter){return Object.entries(currentWrong()).map(([word,value])=>[word,C.projectWrong(value,wrongChapter)]).filter(([,value])=>value).filter(([word,w])=>(group==='uncertain'?w.hasPending||w.pending:group==='mastered'?w.mastered&&!w.pending:!w.mastered&&!w.pending)&&C.fold(word).includes(C.fold(wrongSearch))).sort((a,b)=>b[1].n-a[1].n);}
   function filteredWrong(){return wrongEntries();}
+  function filteredReviewItems(){return wrongFilter==='uncertain'?[]:reviewItems(filteredWrong().filter(([,w])=>!w.mastered&&!w.pending));}
   function showWrongEvidence(word){
-    const entry=currentWrong()[word],saved=wrong[word];if(!entry)return;
-    const rows=records.flatMap(record=>(record.rows||[]).flatMap((row,index)=>row?.w===word?[{record,row,index}]:[]));
-    const snapshots=Object.values(C.evidenceEntry(word,saved||{}).legacySnapshots||{}),snapshotTable=snapshots.length?'<h3>不可变旧证据</h3><table><thead><tr><th>原章节 / 序号</th><th>原始输入</th><th>旧累计声明（未核实）</th></tr></thead><tbody>'+snapshots.map(value=>'<tr><td>'+esc(value.sid)+' / '+(Number.isInteger(value.index)?value.index+1:'—')+'</td><td>'+esc(value.hasInput?value.in:'缺少原始输入')+'</td><td>'+esc(value.n??'—')+'</td></tr>').join('')+'</tbody></table>':'';
-    const body='<p class="notice">确定错误只计可靠答卷证据。独立旧错保留最后原始输入的一次证据；旧累计不代表已核实次数。无法确定是否与完整答卷重复的旧证据单列待核实，不叠加确定次数。缺原始输入的条目仍在待确认分组，掌握标记不改变证据状态。</p><dl><dt>保存的旧输入</dt><dd>'+esc(typeof saved?.in==='string'?saved.in||'空白':'缺少原始输入')+'</dd><dt>旧累计次数</dt><dd>'+esc(saved?.n??'—')+'</dd><dt>当前确定错误</dt><dd>'+entry.n+'</dd><dt>掌握标记</dt><dd>'+(entry.mastered?'已掌握（保留）':'未掌握')+'</dd></dl>'+ (rows.length?'<table><thead><tr><th>原记录 / 题号</th><th>原始输入</th><th>答卷</th></tr></thead><tbody>'+rows.map(({record,row,index})=>'<tr><td>'+esc(record.id)+' / '+(index+1)+'</td><td>'+esc(typeof row.in==='string'?row.in:'缺少原始输入')+'</td><td>'+button('查看原答卷','record','data-id="'+esc(record.id)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table>':'<p>未找到可证明对应的完整答卷；旧输入和原错本仍保存在 JSON 备份。</p>');
+    const entry=currentWrong()[word]&&C.projectWrong(currentWrong()[word],wrongChapter),saved=wrong[word];if(!entry)return;
+    const rows=records.flatMap(record=>(record.rows||[]).flatMap((row,index)=>row?.w===word&&(wrongChapter==='all'||(row.sid||record.sid)===wrongChapter)?[{record,row,index}]:[]));
+    const snapshots=Object.values(C.evidenceEntry(word,saved||{}).legacySnapshots||{}).filter(value=>wrongChapter==='all'||value.sid===wrongChapter),snapshotTable=snapshots.length?'<h3>不可变旧证据</h3><table><thead><tr><th>原章节 / 序号</th><th>原始输入</th><th>旧累计声明（未核实）</th></tr></thead><tbody>'+snapshots.map(value=>'<tr><td>'+esc(value.sid)+' / '+(Number.isInteger(value.index)?value.index+1:'—')+'</td><td>'+esc(value.hasInput?value.in:'缺少原始输入')+'</td><td>'+esc(C.legacyRowId(value)?'独立原始行':value.n??'—')+'</td></tr>').join('')+'</tbody></table>':'';
+    const body='<p class="notice">确定错误只计可靠答卷证据。有稳定身份的旧原始行逐条计数；无身份的旧累计每个原题来源最多计一次，旧累计数字不代表已核实次数。无法确定是否与完整答卷重复的旧证据单列待核实，不叠加确定次数。缺原始输入的条目仍在待确认分组，掌握标记不改变证据状态。</p><dl><dt>当前范围最近有效输入</dt><dd>'+esc(typeof entry.in==='string'?entry.in||'空白':'缺少原始输入')+'</dd><dt>当前范围旧累计次数</dt><dd>'+esc(entry.legacyCount??'—')+'</dd><dt>当前确定错误</dt><dd>'+entry.n+'</dd><dt>掌握标记</dt><dd>'+(entry.mastered?'已掌握（保留）':'未掌握')+'</dd></dl>'+ (rows.length?'<table><thead><tr><th>原记录 / 题号</th><th>原始输入</th><th>答卷</th></tr></thead><tbody>'+rows.map(({record,row,index})=>'<tr><td>'+esc(record.id)+' / '+(index+1)+'</td><td>'+esc(typeof row.in==='string'?row.in:'缺少原始输入')+'</td><td>'+button('查看原答卷','record','data-id="'+esc(record.id)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table>':'<p>未找到可证明对应的完整答卷；旧输入和原错本仍保存在 JSON 备份。</p>');
     modal('原始证据 · '+esc(word),entry.pending?'待确认，不加入普通复习或 TXT':entry.legacyEvidence?'包含独立或待核实的旧错证据':'已定位完整答卷证据',body+snapshotTable,true);
   }
   function wrongTable() {
@@ -3420,7 +3463,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if (!list.length) return `<div class="panel">${empty('这里还没有错词', pending().length ? '换一个章节或搜索词看看。' : '完成一次听写后，错词会出现在这里。也可以导入项目已有的错词记录。', button('去练习', 'route', 'data-route="library"', 'primary') + ' ' + button('导入已有错词', 'legacy'))}</div>`;
     return `<div class="panel table-wrap"><table><thead><tr><th>单词 / 释义</th><th>最近输入</th><th>错误次数</th><th>来自章节</th><th>操作</th></tr></thead><tbody>${list.map(([word, w]) => {
       const item = F.retryItems(D, [[word, w]])[0];
-      return `<tr><td><strong class="english">${esc(word)}</strong><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="red">${esc(typeof w.in==='string'?w.in||'未作答':'原始输入缺失')}</td><td>${w.pending?'待确认':w.manual&&!w.n?'手动标记':w.n+' 次'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':'')+(w.legacyEvidence?.state==='unresolved-link'?' · 旧错证据待核实':'')}</td><td>${esc(w.sid)}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${item?.sid || w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}">${w.pending?(w.mastered?'取消掌握标记（仍待确认）':'标记掌握（仍待确认）'):w.mastered?'移回待复习':'标记掌握'}</button><button class="text-btn" data-act="wrong-evidence" data-word="${esc(word)}">查看证据</button></div></td></tr>`;
+      return `<tr><td><strong class="english">${esc(word)}</strong><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="red">${esc(typeof w.in==='string'?w.in||'未作答':'原始输入缺失')}</td><td>${(w.pending?'待确认':w.manual&&!w.n?'手动标记':w.n+' 次'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':''))+(w.hasPending&&!w.pending?' · 另有待确认旧证据':'')}</td><td>${esc([...new Set(w.sources.map(source=>source.sid))].join("、"))}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${item?.sid || w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}">${w.pending?(w.mastered?'取消掌握标记（仍待确认）':'标记掌握（仍待确认）'):w.mastered?'移回待复习':'标记掌握'}</button><button class="text-btn" data-act="wrong-evidence" data-word="${esc(word)}">查看证据</button></div></td></tr>`;
     }).join('')}</tbody></table></div>`;
   }
   function frequencyStats() {
@@ -3435,7 +3478,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     document.querySelectorAll('[data-wrong-count]').forEach(node=>{node.textContent=node.dataset.wrongCount==='frequency'?filteredFrequency().length:wrongEntries(node.dataset.wrongCount).length;});
     const heading=$('.wrong-banner h2'),review=$('.wrong-banner [data-act="review-all"]');
     if(heading)heading.textContent=wrongBannerTitle();
-    if(review)review.disabled=wrongFilter==='frequency'?!W.practiceItems(D,filteredFrequency()).length:!filteredWrong().some(([,w])=>!w.pending&&!w.mastered);
+    if(review)review.disabled=wrongFilter==='frequency'?!W.practiceItems(D,filteredFrequency()).length:!filteredReviewItems().length;
     if($('#word-profiles')) $('#word-profiles').innerHTML=profileTable();
     decorateAudioControls();
   }
@@ -3477,7 +3520,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       '<label class="checkbox"><input type="checkbox" id="txt-dedupe" checked>去除重复条目</label><div class="modal-footer">'+button('仅单词 TXT','export-answers','data-type="words"')+button('完整词组 TXT','export-answers','data-type="phrases"')+button('当前筛选结果','export-answers','data-type="filtered"')+'</div>');
   }
   function answerEntries(type){
-    const items=type==='filtered'?(wrongFilter==='frequency'?W.practiceItems(D,filteredFrequency()):F.retryItems(D,filteredWrong().filter(([,w])=>!w.pending))):F.retryItems(D,Object.entries(currentWrong()).filter(([,v])=>!v.mastered&&!v.pending));
+    const items=type==='filtered'?(wrongFilter==='frequency'?W.practiceItems(D,filteredFrequency()):wrongFilter==='uncertain'?[]:F.retryItems(D,filteredWrong().filter(([,w])=>!w.pending))):F.retryItems(D,Object.entries(currentWrong()).filter(([,v])=>!v.mastered&&!v.pending));
     if(type==='filtered')return items;
     const list=items.filter(item=>F.kindFor(item,vocabularyTypes,vocabulary)===(type==='phrases'?'phrase':'word'));
     if(type==='words')for(const entry of frequencyStats())if(entry.sources.some(source=>source.phrase&&source.n>0))list.push({w:entry.expected||entry.word});
@@ -4115,12 +4158,16 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function mergeDraftBackup(parsed) {
     const retained = savedDrafts(), active = read('draft', null);
     const known = new Map([...retained, ...(validDraft(active) ? [active] : [])].map(value => [value.id, value]));
-    const signature = value => JSON.stringify([value.items, value.inputs, value.states, value.explicitSkips || [], value.timedOut || [], value.idx, value.elapsed]);
+    // Older releases used only the reserved suffix. Preserve that lineage when
+    // migrating; new collisions carry it explicitly through backup/export.
+    const sourceId = value => typeof value.importSourceId==='string'&&value.importSourceId ? value.importSourceId : value.id.replace(/(?:-import-\d+)+$/, '');
+    const signature = value => { const {id,importSourceId,...content}=value;return C.stableJSON(content); };
     for (const value of [parsed.draft, ...(Array.isArray(parsed.drafts) ? parsed.drafts : [])].filter(validDraft)) {
-      if (known.has(value.id) && signature(known.get(value.id)) === signature(value)) continue;
+      const origin=sourceId(value),content=signature(value);
+      if ([...known.values()].some(existing=>sourceId(existing)===origin&&signature(existing)===content)) continue;
       let id = value.id, suffix = 1;
       while (known.has(id)) id = `${value.id}-import-${suffix++}`;
-      const copy = { ...value, id }; retained.push(copy); known.set(id, copy);
+      const copy = { ...value, id, ...(id!==value.id?{importSourceId:origin}:{}) }; retained.push(copy); known.set(id, copy);
     }
     return retained;
   }
@@ -4259,7 +4306,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       case 'review-frequency': reviewFrequency(d.word); break;
       case 'export-frequency': exportFrequency(); break;
       case 'master': {if(!recoverEvidenceWrite())break;const next=C.mutateWrong(wrong,{type:'master',word:d.word,value:!currentWrong()[d.word]?.mastered,now:Date.now(),actionId:'master:'+Date.now()+':'+Math.random()});if(!writeEvidence(records,next))break;render();toast(currentWrong()[d.word]?.pending?'掌握标记已保存；证据仍待确认。':next[d.word].mastered?'已标记掌握，可在「已掌握」中移回。':'已移回待复习。');break;}
-      case 'review-all': { if (wrongFilter === 'frequency') { reviewFrequency(); break; } const items = reviewItems(filteredWrong().filter(([, w]) => !w.mastered&&!w.pending)); if (!items.length) return toast('当前筛选下没有待复习的单词。'); openSetup(wrongChapter === 'all' ? 'review' : wrongChapter, items); break; }
+      case 'review-all': { if (wrongFilter === 'frequency') { reviewFrequency(); break; } const items = filteredReviewItems(); if (!items.length) return toast('当前筛选下没有待复习的单词。'); openSetup(wrongChapter === 'all' ? 'review' : wrongChapter, items); break; }
       case 'retry-wrong': { const items = C.retryItems(D,C.recordView(result,RULES)); openSetup(result.sid, items); break; }
       case 'retry': openSetup(result.sid, result.rows.map(r => C.itemForRow(D, r, result.sid)).filter(Boolean)); break;
       case 'speak': { const item = C.itemsFor(D, d.sid)[Number(d.index)]; if (item) speak(item, true); else toast('未找到这个词的原音。'); break; }
@@ -4274,7 +4321,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
         if (!rows.length) { toast('当前没有词条可导出。'); break; }
         exportRecords([result],new Set(filteredResultRows().map(item=>item.index))); break;
       }
-      case 'export-wrong': if (!Object.keys(currentWrong()).length) { toast('目前还没有错词可导出。'); break; } csvDownload('错词本', [['单词','章节','最近输入','确定错误次数','掌握状态','旧累计次数（待确认）'], ...Object.entries(currentWrong()).map(([w, v]) => [w,v.sid,v.in,v.n,v.pending?'待确认':v.mastered?'已掌握':v.manual?'手动标记':'待复习',v.legacyCount??''])]); break;
+      case 'export-wrong': if (!filteredWrong().length) { toast('当前筛选下没有错词可导出。'); break; } csvDownload('错词本', [['单词','章节','最近输入','确定错误次数','掌握状态','旧累计次数（待确认）','另有待确认来源'], ...filteredWrong().map(([w, v]) => [w,v.sources.map(source=>source.sid).filter((sid,i,all)=>all.indexOf(sid)===i).join('、'),v.in,v.n,v.pending?'待确认':v.mastered?'已掌握':v.manual&&!v.n?'手动标记':'待复习',v.legacyCount??'',v.hasPending?'是':'否'])]); break;
       case 'backup': download('听写室备份-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json', JSON.stringify(backupData(), null, 2), 'application/json'); break;
       case 'restore': restore(); break;
     }
