@@ -14,5 +14,69 @@
     "url": "clips_reviewed/C3-T3/0009-26fe072bf36c06c13314.wav",
     "sha256": "c986a75b25483cea0604de93136b30abff08bada90e648a491b22a03878e16aa",
     "duration": 1.1123125
+  },
+  {
+    "sid": "C5-T12",
+    "index": 27,
+    "word": "effect",
+    "url": "clips_reviewed/C5-T12/0027-510414c0a2de86392746.wav",
+    "sha256": "4aa7ec257b24573f77ea574f4f982401197f481c0dd93de3ad60271ee909c49a",
+    "duration": 0.786
+  },
+  {
+    "sid": "C11-T1",
+    "index": 255,
+    "word": "weekly return",
+    "url": "clips_reviewed/C11-T1/0255-57785d67d241e78217e3.wav",
+    "sha256": "82493b82678cf6479eb19844677c87541df3066dc000ca3eb42a53ea989c6b99",
+    "duration": 1.2033125
+  },
+  {
+    "sid": "C5-T11",
+    "index": 99,
+    "word": "weekly return",
+    "url": "clips_reviewed/C5-T11/0099-a3e062c82f40af3db39c.wav",
+    "sha256": "95491b78b6691de5c0f8867ad57efa70aab8d8e8b203d32b492f82a36ee28d72",
+    "duration": 1.121875
+  },
+  {
+    "sid": "C3-T1",
+    "index": 36,
+    "word": "appearance",
+    "url": "clips_reviewed/C3-T1/0036-b44cb13463b110ea297d.wav",
+    "sha256": "599f2f5ccca361be29a61f97b3ae43c201e3a3fb3e76c8bddb1df23b72f9732f",
+    "duration": 1.11
+  },
+  {
+    "sid": "C11-T1",
+    "index": 94,
+    "word": "survey",
+    "url": "clips_reviewed/C11-T1/0094-bd59fbb2698d4e0b202b.wav",
+    "sha256": "cb16dd6c64af4faade52518a0a7aeff18d54a032efcee65a06c116c1b77e8241",
+    "duration": 0.921875
+  },
+  {
+    "sid": "C5-T8",
+    "index": 92,
+    "word": "postal survey",
+    "url": "clips_reviewed/C5-T8/0092-9518292921206255a63a.wav",
+    "sha256": "17fc7762a8f56ce17de8bd0dcd942ef0b5c9d1e0f057cbb8b2483c6231145c68",
+    "duration": 1.312125
+  },
+  {
+    "sid": "C11-T3",
+    "index": 239,
+    "word": "survey methods",
+    "url": "clips_reviewed/C11-T3/0239-e7892eebd58631eeb96c.wav",
+    "sha256": "46cc4b45a6aa01adf06bc455279fb230f08a1f1c6c628aae68f581c4196223f2",
+    "duration": 1.4068125
+  },
+  {
+    "sid": "C5-T10",
+    "index": 127,
+    "word": "telephone survey",
+    "url": "clips_reviewed/C5-T10/0127-49fa4ed38ee4054540f6.wav",
+    "sha256": "2b50229f7a5452d3814038f187bcee1a6ce3e6d61f2912b2822905d206866fab",
+    "duration": 1.353
   }
 ]

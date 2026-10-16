@@ -29,11 +29,14 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/review-qa" --no-save --package-lock=false playwright@1.62.1
           node "$RUNNER_TEMP/review-qa/node_modules/playwright/cli.js" install --with-deps chrome
-      - name: Chrome submission, filtering and repeated restore
+      - name: All delivered Chrome suites
         env:
           PLAYWRIGHT_PATH: ${{ runner.temp }}/review-qa/node_modules/playwright
-          REVIEW_BROWSER_OUTPUT: ${{ runner.temp }}/review-artifacts
-        run: node tests/review-scope-browser.cjs index.html
+        run: |
+          mkdir -p "$RUNNER_TEMP/review-artifacts/learning" "$RUNNER_TEMP/review-artifacts/integrity"
+          P1_RESULT="$RUNNER_TEMP/review-artifacts/learning/results.json" node tests/learning-browser.cjs index.html
+          INTEGRITY_RESULT="$RUNNER_TEMP/review-artifacts/integrity/results.json" node tests/data-integrity-browser.cjs index.html
+          REVIEW_BROWSER_OUTPUT="$RUNNER_TEMP/review-artifacts/review-scope" node tests/review-scope-browser.cjs index.html
       - name: Preserve Chrome evidence
         if: always()
         uses: actions/upload-artifact@v4

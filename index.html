@@ -2218,6 +2218,9 @@ button.heat-cell:hover { transform:translateY(-1px); box-shadow:0 0 0 2px #8c77d
 .frequency-rank{display:inline-block;min-width:24px;margin-right:10px;color:var(--muted);font-size:11px}
 .frequency-count{color:var(--purple)}
 .frequency-breakdown{display:block;margin-top:5px;color:var(--muted);font-size:11px}
+.review-reason{margin:4px 4px 0 0;font-size:11px}
+.review-token{margin:10px 0;padding:8px 12px;border-left:2px solid var(--purple);line-height:1.7}
+.wrong-toolbar>.row{flex-wrap:wrap}
 .frequency-sources{white-space:normal;min-width:150px;max-width:300px}
 .frequency-sources>span{display:block;margin:3px 0;overflow-wrap:anywhere}
 .frequency-sources small{color:var(--muted);font-size:11px}
@@ -2360,7 +2363,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     while (variants.some(value => optional.test(value))) variants = variants.flatMap(value => optional.test(value) ? [value.replace(optional, '$1'), value.replace(optional, '$1$2')] : [value]);
     return variants;
   }
-  const ANALYSIS_VERSION = 'p0-v3';
+  const ANALYSIS_VERSION = 'p0-v4';
   // Fingerprint actual policy contents, including in-place whitelist edits.
   function ruleSignature(rules={}) {
     const text=JSON.stringify([ANALYSIS_VERSION,rules.accept||[],rules.learningFormats||[],rules.scoring||{}]);
@@ -2394,15 +2397,18 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return prepared.expression ? normalizeForm(value).replace(prepared.expression, (_,prefix,form) => prefix+prepared.aliases.get(form)) : normalizeForm(value);
   }
   // Only explicitly reviewed separator pairs receive learning-only tolerance.
-  function formatEquivalent(input, answer, settings, rules = {}) {
-    if (!normalize(input) || !rules.learningFormats?.length) return false;
+  function canonicalLearningFormat(value,rules) {
+    if(!rules.learningFormats?.length)return canonicalSpelling(value,rules,true);
     let prepared=learningFormatCaches.get(rules);
     if (!prepared || prepared.signature!==JSON.stringify(rules.learningFormats)) {
       prepared={signature:JSON.stringify(rules.learningFormats),rules:{accept:rules.learningFormats}};
       learningFormatCaches.set(rules,prepared);
     }
-    const canonical=value=>canonicalSpelling(canonicalSpelling(value,rules,settings.ignoreCase),prepared.rules,settings.ignoreCase);
-    return answerForms(answer).some(form=>canonical(input)===canonical(form));
+    return canonicalSpelling(canonicalSpelling(value,rules,true),prepared.rules,true);
+  }
+  function formatEquivalent(input, answer, settings, rules = {}) {
+    if (!normalize(input) || !rules.learningFormats?.length) return false;
+    return answerForms(answer).some(form=>canonicalLearningFormat(input,rules)===canonicalLearningFormat(form,rules));
   }
   function grade(input, answer, settings, rules = {}) {
     const a = normalize(input), b = normalize(answer), compare = settings.ignoreCase ? fold : normalize;
@@ -2431,12 +2437,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return result;
   }
   function scoreWord(input, answer, settings, rules) {
-    const compare = settings.ignoreCase ? fold : normalize;
-    if (compare(input) === compare(answer)) return [];
-    // With case sensitivity enabled, accepting morphology must not erase
-    // a case error. Preserve lower/title/upper case across the replacement.
-    const caseStyle = word => word === word.toLowerCase() ? 'lower' : word === word.toUpperCase() ? 'upper' : /^[A-Z][a-z]+$/.test(word) ? 'title' : word;
-    if (!settings.ignoreCase && caseStyle(input) !== caseStyle(answer)) return null;
+    if (fold(input) === fold(answer)) return [];
     const a = fold(input), b = fold(answer), numbers = rules.scoring?.number || {};
     const left = [a, ...(numbers[a] || [])], right = [b, ...(numbers[b] || [])];
     for (const x of left) for (const y of right) {
@@ -2446,20 +2447,28 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       const cx = canonicalSpelling(x, rules, true), cy = canonicalSpelling(y, rules, true);
       const number = x !== a || y !== b;
       if (cx === cy) return [...(number ? ['number'] : []), ...(x !== cx || y !== cy ? ['spelling'] : [])];
+    }
+    // Every lawful spelling/number candidate wins over a homophone candidate.
+    for (const x of left) for (const y of right) {
+      if (x !== a && y !== b) continue;
+      const cx = canonicalSpelling(x, rules, true), cy = canonicalSpelling(y, rules, true),number=x!==a||y!==b;
       const homophones = rules.scoring?.homophones || {};
       if (homophones[cx]?.includes(cy) || homophones[cy]?.includes(cx)) return [...(number ? ['number'] : []), 'homophone'];
     }
     return null;
   }
-  function scoreGrade(input, answer, settings, rules = {}) {
+  // Learning policy only: token alignment calls this without recursively building observations.
+  function learningGrade(input, answer, settings = {}, rules = {}) {
+    settings={...settings,ignoreCase:true};
     const live = grade(input, answer, settings, rules);
     const formatCorrect = !live.loose && formatEquivalent(input,answer,settings,rules);
     let acceptedBy = live.strict ? [] : live.loose ? ['spelling'] : formatCorrect ? ['format'] : null;
     if (acceptedBy === null && normalize(input)) {
       const tokenize = value => normalize(value).match(/[A-Za-z]+(?:['’][A-Za-z]+)*|[^A-Za-z]+/g) || [];
-      const left = tokenize(input);
+      const canonicalInput=canonicalLearningFormat(input,rules),left = tokenize(canonicalInput);
+      let homophoneAcceptance=null;
       for (const form of answerForms(answer)) {
-        const right = tokenize(form), changes = new Set();
+        const canonicalAnswer=canonicalLearningFormat(form,rules),right = tokenize(canonicalAnswer), changes = new Set();
         if (left.length !== right.length) continue;
         const matches = left.every((part,i) => {
           if (!/^[A-Za-z]/.test(part)) return part === right[i];
@@ -2468,17 +2477,76 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
           if (reasons === null) return false;
           reasons.forEach(reason => changes.add(reason)); return true;
         });
-        if (matches) { acceptedBy = [...changes]; break; }
+        if (matches) {
+          if(canonicalInput!==canonicalSpelling(input,rules,true)||canonicalAnswer!==canonicalSpelling(form,rules,true))changes.add('format');
+          if(changes.has('homophone'))homophoneAcceptance??=[...changes];
+          else {acceptedBy = [...changes]; break;}
+        }
       }
+      acceptedBy??=homophoneAcceptance;
     }
     const strictCorrect=live.loose,learningCorrect=acceptedBy!==null,formatIssues=[];
     const rawNormalized=String(input??'').normalize('NFKC');
     if(rawNormalized!==rawNormalized.replace(/\s+/g,' ').trim())formatIssues.push('whitespace');
     if(/[\u2010\u2011]/.test(rawNormalized))formatIssues.push('hyphen-character');
     if (formatCorrect || (!strictCorrect && normalize(input) && fold(input).replace(/[ -]/g,'')===fold(answer).replace(/[ -]/g,''))) formatIssues.push('boundary');
-    if (!strictCorrect && !settings.ignoreCase && fold(input)===fold(answer)) formatIssues.push('case');
     const assessment={learningCorrect,strictCorrect,formatIssues,acceptedBy:acceptedBy||[]};
     return {...live, strict:strictCorrect, liveCorrect:learningCorrect,book:learningCorrect,correct:learningCorrect,acceptedBy:acceptedBy||[],assessment};
+  }
+  const tokens=value=>normalize(value).match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*(?:-[\p{L}\p{N}]+)*/gu)||[];
+  function distance(a,b){let prev=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){const next=[i];for(let j=1;j<=b.length;j++)next[j]=Math.min(prev[j]+1,next[j-1]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));prev=next;}return prev[b.length];}
+  function tokenObservation(value,tokenIndex) {
+    const learningCorrect=value.verdict==='pending'?null:value.verdict==='correct';
+    const reviewReasons=value.verdict==='incorrect'?['spelling']:value.verdict==='omission'?['omission']:learningCorrect&&value.acceptedBy?.includes('homophone')?['homophone']:[];
+    return {...value,expected:value.word,tokenIndex,learningCorrect,reviewRequired:reviewReasons.length>0,reviewReasons,...(learningCorrect===null?{pending:true,pendingReason:value.reason}:{})};
+  }
+  // Preserve attribution from EVERY minimum-cost path, without enumerating paths.
+  function align(expected,actual,settings,rules){
+    const n=expected.length,m=actual.length;
+    if(n>64||m>64||expected.join('').length>512||actual.join('').length>512)return {cost:Infinity,rows:expected.map(word=>({word,input:'',verdict:'pending',reason:'输入过长，待确认'}))};
+    const edges=Array.from({length:n+1},()=>Array.from({length:m+1},()=>[])),forward=Array.from({length:n+1},()=>Array(m+1).fill(Infinity)),back=Array.from({length:n+1},()=>Array(m+1).fill(Infinity));
+    for(let i=0;i<=n;i++)for(let j=0;j<=m;j++){
+      const add=(di,dj,cost,values)=>edges[i][j].push({i:i+di,j:j+dj,cost,values});
+      if(i<n&&j<m){const grade=learningGrade(actual[j],expected[i],settings,rules),ok=grade.correct;const cost=ok?0:10+Math.min(9,Math.round(9*distance(fold(actual[j]),fold(expected[i]))/Math.max(expected[i].length,actual[j].length,1)));add(1,1,cost,[{at:i,input:actual[j],verdict:ok?'correct':'incorrect',acceptedBy:grade.acceptedBy,reason:ok?'标准 / 合法变体':'拼写差异',owner:j}]);}
+      if(i<n)add(1,0,10,[{at:i,input:'',verdict:'omission',reason:'漏写',owner:-1}]);
+      if(j<m)add(0,1,10,[]);
+      for(const [di,dj] of [[2,1],[1,2],[3,1],[1,3],[4,1],[1,4]])if(i+di<=n&&j+dj<=m){
+        const left=expected.slice(i,i+di).join(' '),right=actual.slice(j,j+dj).join(' '),a=fold(left).replace(/[ -]/g,''),b=fold(right).replace(/[ -]/g,'');
+        const grade=learningGrade(right,left,settings,rules),legal=grade.correct,d=distance(a,b);
+        const anchored=expected.slice(i,i+di).some(word=>actual.slice(j,j+dj).some(input=>fold(word)===fold(input)));
+        if(!legal&&anchored)continue;
+        // A compound homophone match cannot identify which component needs review.
+        const attributable=legal&&!grade.acceptedBy.includes('homophone');
+        if(legal||d/Math.max(a.length,b.length,1)<=.25)add(di,dj,legal?0:8+Math.min(9,d),expected.slice(i,i+di).map((word,k)=>({at:i+k,input:right,verdict:attributable?'correct':'pending',acceptedBy:grade.acceptedBy,reason:attributable?'合法变体 / 学习格式容差':'拆合词边界待确认',owner:j})));
+      }
+    }
+    forward[0][0]=0;for(let i=0;i<=n;i++)for(let j=0;j<=m;j++)for(const e of edges[i][j])forward[e.i][e.j]=Math.min(forward[e.i][e.j],forward[i][j]+e.cost);
+    back[n][m]=0;for(let i=n;i>=0;i--)for(let j=m;j>=0;j--)for(const e of edges[i][j])back[i][j]=Math.min(back[i][j],e.cost+back[e.i][e.j]);
+    const choices=expected.map(()=>new Map());for(let i=0;i<=n;i++)for(let j=0;j<=m;j++)for(const e of edges[i][j])if(forward[i][j]+e.cost+back[e.i][e.j]===forward[n][m])for(const value of e.values)choices[value.at].set(JSON.stringify([value.owner,value.input,value.verdict,value.acceptedBy?.includes('homophone')||false]),value);
+    return {cost:forward[n][m],rows:expected.map((word,i)=>{const values=[...choices[i].values()];return values.length===1?{word,...values[0]}:{word,input:'',verdict:'pending',reason:'多个等价对齐，归属待确认'};})};
+  }
+  function occurrencesForRow(input,answer,settings={},rules={}){
+    const actual=tokens(input),forms=answerForms(answer).map(form=>({form,grade:learningGrade(input,form,settings,rules)}));
+    const lawful=forms.filter(value=>value.grade.correct&&!value.grade.acceptedBy.includes('homophone'));
+    const candidates=(lawful.length?lawful:forms).map(value=>align(tokens(value.form),actual,settings,rules));
+    const cost=Math.min(...candidates.map(c=>c.cost)),best=candidates.filter(c=>c.cost===cost),first=best[0];if(!first)return [];
+    // Learning-correct homophones are distinct targets, never interchangeable answer identities.
+    const sameTarget=(a,b)=>{const g=learningGrade(a,b,settings,rules);return g.correct&&!g.acceptedBy.includes('homophone');};
+    const sameLength=best.every(c=>c.rows.length===first.rows.length);
+    return first.rows.map((row,i)=>{
+      const compatible=sameLength&&best.every(c=>{const value=c.rows[i];return value.input===row.input&&value.verdict===row.verdict&&value.owner===row.owner&&Boolean(value.acceptedBy?.includes('homophone'))===Boolean(row.acceptedBy?.includes('homophone'))&&sameTarget(value.word,row.word);});
+      return tokenObservation(compatible?row:{...row,verdict:'pending',reason:'可选答案身份待确认'},i);
+    });
+  }
+  function scoreGrade(input,answer,settings={},rules={}) {
+    const grade=learningGrade(input,answer,settings,rules),tokenObservations=occurrencesForRow(input,answer,settings,rules);
+    const reviewReasons=[...new Set(tokenObservations.flatMap(value=>value.reviewReasons))];
+    const reviewRequired=!grade.correct||reviewReasons.length>0;
+    const reviewPending=tokenObservations.some(value=>value.learningCorrect===null)||(!grade.correct&&!tokenObservations.some(value=>value.learningCorrect===false));
+    const reviewPendingReasons=[...new Set(tokenObservations.filter(value=>value.pending).map(value=>value.pendingReason))];
+    if(reviewPending&&!reviewPendingReasons.length)reviewPendingReasons.push('整题与标准不符，词级错误归属待确认');
+    const assessment={...grade.assessment,reviewRequired,reviewReasons,tokenObservations,reviewPending,reviewPendingReasons};
+    return {...grade,learningCorrect:grade.correct,reviewRequired,reviewReasons,reviewPending,reviewPendingReasons,assessment};
   }
   function recordTotals(rows) {
     const count = key => rows.filter(row => row[key]).length;
@@ -2488,14 +2556,18 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       pctStrict: percentage('strict'), pctLoose: percentage('loose'), pctBook: percentage('correct'), pct: percentage('correct')};
   }
   function makeRecord(session, settings, rules, title, now = Date.now()) {
-    const rows = session.items.map((item,i) => ({
-      sid: item.sid, index: item.index, w: item.w, m: item.m || '', in: session.inputs[i] || '',
+    const rows = session.items.map((item,i) => {
+      const input=session.inputs[i]||'',snapshot=session.immediate?.[i],state=session.states?.[i];
+      const immediate=snapshot?.input===input&&snapshot.answer===item.w&&typeof snapshot.correct==='boolean'?JSON.parse(JSON.stringify(snapshot)):
+        !snapshot&&['correct','incorrect','skip','timeout'].includes(state)?{input,answer:item.w,correct:state==='correct',source:'saved-state'}:null;
+      return {sid: item.sid, index: item.index, w: item.w, m: item.m || '', in: input,
       ...(session.timedOut?.includes(i) ? {timedOut: true} : {}),
       ...(item.previousWords?.length ? {previousWords: item.previousWords.slice()} : {}),
       ...scoreGrade(session.inputs[i], item.w, settings, rules),
-    }));
+      liveCorrect:immediate?.correct??null,...(immediate?{immediate}:{}),
+    };});
     return {id: session.id, sid: session.sid, title, analysisVersion:ANALYSIS_VERSION, rulesSignature:ruleSignature(rules), grading: 'book', gradingVersion: rules.scoring?.version || 1,
-      liveGrading: settings.looseRules ? 'loose' : 'strict', ignoreCase: Boolean(settings.ignoreCase),
+      liveGrading: settings.looseRules ? 'loose' : 'strict', ignoreCase: true,
       mode: session.order === 'shuffle' ? 'shuffle' : session.mode, ts: now, ms: session.elapsed || 0,
       ...recordTotals(rows), rows};
   }
@@ -2517,10 +2589,10 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const rawKey=JSON.stringify([record.mode,record.ignoreCase,record.rows.map(row=>[row?.w,row?.in])]);
     const cached=recordViews.get(record);if(cached?.signature===signature&&cached.rawKey===rawKey)return cached.view;
     const supported=['normal','dictation','shuffle','wrong'].includes(record.mode);
-    const settings={ignoreCase:record.ignoreCase!==false,looseRules:true};
+    const settings={ignoreCase:true,looseRules:true};
     const rows=record.rows.map(row=>{
       if(supported&&row&&typeof row.w==='string'&&typeof row.in==='string')return {...row,...scoreGrade(row.in,row.w,settings,rules)};
-      return {...row,correct:null,strict:null,loose:null,liveCorrect:null,acceptedBy:[],assessment:{learningCorrect:null,strictCorrect:null,formatIssues:[],acceptedBy:[],pending:true}};
+      return {...row,correct:null,learningCorrect:null,reviewRequired:false,reviewReasons:[],reviewPending:false,reviewPendingReasons:[],strict:null,loose:null,liveCorrect:null,acceptedBy:[],assessment:{learningCorrect:null,strictCorrect:null,reviewRequired:false,reviewReasons:[],tokenObservations:[],reviewPending:false,reviewPendingReasons:[],formatIssues:[],acceptedBy:[],pending:true}};
     });
     const view={...record,rows,...recordTotals(rows),analysisVersion:ANALYSIS_VERSION,rulesSignature:signature,grading:'book',originalScore:record.originalScore??record.pct??record.pctLoose??null};
     rawSources.set(view,record);recordViews.set(record,{signature,rawKey,view});return view;
@@ -2538,6 +2610,16 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   const stableValue=value=>Array.isArray(value)?value.map(stableValue):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,stableValue(value[key])])):value;
   const stableJSON=value=>JSON.stringify(stableValue(value));
   const referenceId=(recordId,rowIndex)=>JSON.stringify([recordId,rowIndex]);
+  const reviewEventId=(recordId,rowIndex,tokenIndex)=>JSON.stringify([recordId,rowIndex,tokenIndex]);
+  const needsReview=row=>typeof row.reviewRequired==='boolean'?row.reviewRequired:row.correct===false;
+  function reviewEvents(row,recordId,rowIndex,legacyIdentity) {
+    return (row.assessment?.tokenObservations||[]).filter(value=>value.reviewRequired).map(value=>({
+      id:legacyIdentity?JSON.stringify(['legacy',legacyIdentity,value.tokenIndex]):reviewEventId(recordId,rowIndex,value.tokenIndex),
+      recordId,rowIndex,tokenIndex:value.tokenIndex,sid:row.sid,index:row.index,expected:value.expected,input:value.input,
+      context:row.w,rawInput:row.in,ts:row.ts,
+      learningCorrect:value.learningCorrect,reviewRequired:true,reviewReasons:value.reviewReasons.slice(),
+    }));
+  }
   function validWrongEntry(value) {
     if(!value||typeof value!=='object'||Array.isArray(value))return false;
     if(value.evidenceVersion!==1)return typeof value.sid==='string'&&Number.isFinite(value.n);
@@ -2579,11 +2661,11 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const result={...stored},put=(word,entry)=>Object.defineProperty(result,word,{value:entry,enumerable:true,writable:true,configurable:true});
     if(operation.type==='merge')for(const [word,saved]of Object.entries(operation.wrong||{}))put(word,mergeEvidence(word,Object.hasOwn(result,word)?result[word]:{},saved));
     if(operation.type==='record')operation.record.rows.forEach((row,rowIndex)=>{
-      if(row.correct!==false)return;const entry=evidenceEntry(row.w,Object.hasOwn(result,row.w)?result[row.w]:{}),id=referenceId(operation.record.id,rowIndex);
+      if(!needsReview(row))return;const entry=evidenceEntry(row.w,Object.hasOwn(result,row.w)?result[row.w]:{}),id=referenceId(operation.record.id,rowIndex);
       if(Object.hasOwn(entry.historyRefs,id))return;
       entry.historyRefs[id]={recordId:operation.record.id,rowIndex};entry.sid=row.sid||operation.record.sid;entry.index=row.index;entry.in=row.in;entry.ts=operation.record.ts;
       // n remains a compatibility field; current counts are derived from refs/raw rows, never old n.
-      entry.n=Object.keys(entry.historyRefs).length;setMastery(entry,false,operation.now,'error:'+id);put(row.w,entry);
+      entry.n=(Number.isFinite(entry.n)?entry.n:0)+(row.correct===false?1:0);setMastery(entry,false,operation.now,'review:'+id);put(row.w,entry);
     });
     if(operation.type==='master'){const entry=evidenceEntry(operation.word,Object.hasOwn(result,operation.word)?result[operation.word]:{});setMastery(entry,operation.value,operation.now,operation.actionId);put(operation.word,entry);}
     if(operation.type==='manual')for(const item of operation.items){const entry=evidenceEntry(item.w,Object.hasOwn(result,item.w)?result[item.w]:{}),source={sid:item.sid,index:item.index,word:item.w},id=stableJSON(source);entry.manualSources[id]=source;entry.sid=item.sid;entry.index=item.index;entry.manual=true;entry.n=entry.n||0;setMastery(entry,false,operation.now,operation.actionId);put(item.w,entry);}
@@ -2594,6 +2676,46 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       if(known.has(record.id)){if(stableJSON(known.get(record.id))!==stableJSON(record))throw Error('record-id-conflict: '+record.id);continue;}
       known.set(record.id,record);result.push(record);
     }return result;
+  }
+  function draftMatchesRecord(draft,record) {
+    if(!draft||!record||draft.id!==record.id||!Array.isArray(draft.items)||!Array.isArray(draft.inputs)||!Array.isArray(record.rows))return false;
+    return stableJSON(draft.items.map((item,index)=>[item.w,draft.inputs[index]||'',item.sid||draft.sid,item.index]))===stableJSON(record.rows.map(row=>[row.w,row.in,row.sid||record.sid,row.index]));
+  }
+  const completedDraftMirror=(draft,records)=>records.some(record=>draftMatchesRecord(draft,record));
+  const validDraft=value=>value?.mode==='dictation'&&typeof value.id==='string'&&Array.isArray(value.items)&&value.items.length>0&&value.items.every(item=>item&&typeof item.w==='string'&&typeof item.sid==='string'&&Number.isInteger(item.index))&&Array.isArray(value.inputs);
+  function mergeDrafts(local=[],active,incoming=[]) {
+    const result=[],known=validDraft(active)?[active]:[],source=value=>typeof value.importSourceId==='string'&&value.importSourceId?value.importSourceId:value.id;
+    const signature=value=>{const {id,importSourceId,...content}=value;return stableJSON(content);};
+    const same=(a,b)=>source(a)===source(b)&&signature(a)===signature(b);
+    const append=(value,existing)=>{
+      if((existing?result:known).some(other=>same(value,other)))return;
+      let id=value.id,suffix=1;
+      while(known.some(other=>other.id===id&&!same(value,other)))id=value.id+'-import-'+suffix++;
+      const copy={...cloneEvidence(value),id,...(id!==value.id?{importSourceId:source(value)}:{})};result.push(copy);known.push(copy);
+    };
+    for(const value of (Array.isArray(local)?local:[]).filter(validDraft))append(value,true);
+    for(const value of (Array.isArray(incoming)?incoming:[]).filter(validDraft))append(value,false);
+    return result;
+  }
+  function mergeJournalExtras(current,extras={}) {
+    const result={};
+    for(const [name,value]of Object.entries(extras)){
+      if(name==='drafts')result[name]=mergeDrafts(current.drafts,current.draft,value);
+      else if(name==='vocabularyTypes')result[name]={...(current.vocabularyTypes||{}),...cloneEvidence(value)};
+      else if(name==='audioCorrections'){
+        const rows=new Map();for(const row of [...(current.audioCorrections||[]),...(value||[])]){const old=rows.get(row.key);if(!old||(row.updatedAt||0)>(old.updatedAt||0))rows.set(row.key,cloneEvidence(row));}result[name]=[...rows.values()];
+      }else result[name]=cloneEvidence(value);
+    }
+    return result;
+  }
+  // Emergency export folds an uncommitted journal into the existing backup schema in memory.
+  function materializeBackup(snapshot) {
+    const backup=cloneEvidence(snapshot),patch=backup.pendingWrite;
+    if(patch){backup.records=mergeRecords(backup.records||[],patch.records||[]);backup.wrong=mutateWrong(backup.wrong||{},{type:'merge',wrong:patch.wrong||{}});
+      const extras=Object.fromEntries(['settings','drafts','paper','vocabularyTypes','audioCorrections'].filter(name=>Object.hasOwn(patch.extras||{},name)).map(name=>[name,patch.extras[name]]));
+      Object.assign(backup,mergeJournalExtras(backup,extras));
+    }
+    delete backup.pendingWrite;return backup;
   }
   // Only the bundled XLSX row identity proves a distinct old answer. Arbitrary
   // snapshot keys/sourceId values and cumulative n do not prove attempt counts.
@@ -2607,25 +2729,35 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const sources=(entry.sources||[]).filter(source=>sid==='all'||source.sid===sid);
     if(!sources.length)return null;
     const n=sources.reduce((sum,source)=>sum+source.n,0),manual=sources.some(source=>source.manual);
+    const counts=reviewCounts(sources.flatMap(source=>source.occurrences||[])),reviewRows=sources.reduce((sum,source)=>sum+(source.reviewRows??source.n),0);
     const occurrences=sources.flatMap(source=>source.occurrences||[]);
-    const valid=occurrences.filter(value=>value.type==='history'||value.state==='independent');
+    const valid=occurrences.filter(value=>value.type==='history'||value.state==='independent'&&value.counted);
     const latest=valid.slice().sort((a,b)=>(a.ts??-Infinity)-(b.ts??-Infinity)||(a.recordId&&a.recordId===b.recordId?a.rowIndex-b.rowIndex:0)||String(a.occurrenceId).localeCompare(String(b.occurrenceId))).at(-1);
-    const first=latest||sources.find(source=>source.n||source.manual)||sources[0];
+    const first=latest||sources.find(source=>source.reviewRows||source.n||source.manual)||sources[0];
     const unresolved=occurrences.filter(value=>['missing-input','unresolved-link','conflicting-source'].includes(value.state));
     const legacyCount=Math.max(0,...sources.map(source=>source.legacyCount||0));
-    return {...entry,sources,sid:first.sid,index:first.index,in:latest?.input,ts:latest?.ts,n,manual,
-      pending:!n&&!manual,hasPending:unresolved.length>0||sources.some(source=>source.pending),
+    return {...entry,sources,sid:first.sid,index:first.index,in:latest?.input,ts:latest?.ts,n,rowErrors:n,manual,...counts,reviewRows,reviewRequired:reviewRows>0,
+      reviewPending:sources.some(source=>source.reviewPending),pending:!reviewRows&&!manual,hasPending:unresolved.length>0||sources.some(source=>source.pending),
       legacyCount:legacyCount||undefined,legacyPending:Math.max(0,legacyCount-1),legacyEvidence:unresolved[0]||valid.find(value=>value.type==='legacy')};
+  }
+  function reviewCounts(occurrences) {
+    const events=new Map();
+    for(const row of occurrences)if(row.type==='history'||row.type==='legacy'&&row.counted)for(const event of row.reviewEvents||[])events.set(event.id,event);
+    const count=reason=>[...events.values()].filter(event=>event.reviewReasons.includes(reason)).length;
+    const spellingCount=count('spelling'),omissionCount=count('omission'),homophoneCount=count('homophone');
+    return {spellingCount,omissionCount,homophoneCount,reviewCount:spellingCount+omissionCount+homophoneCount,reviewReasons:['homophone','spelling','omission'].filter(reason=>count(reason)>0)};
   }
   function deriveWrong(records,stored={},rules={}) {
     const history=historyViews(records,rules),words=new Set(Object.keys(stored)),byWord=new Map(),result=Object.create(null);
     for(const record of history)if(['normal','dictation','shuffle','wrong'].includes(record.mode))record.rows.forEach((row,rowIndex)=>{
-      if(typeof row.w!=='string')return;words.add(row.w);if(!byWord.has(row.w))byWord.set(row.w,[]);byWord.get(row.w).push({recordId:record.id,rowIndex,sid:row.sid||record.sid,index:row.index,input:row.in,ts:record.ts,correct:row.correct,occurrenceId:referenceId(record.id,rowIndex)});
+      if(typeof row.w!=='string')return;words.add(row.w);if(!byWord.has(row.w))byWord.set(row.w,[]);
+      const source={...row,sid:row.sid||record.sid,ts:record.ts};
+      byWord.get(row.w).push({recordId:record.id,rowIndex,sid:source.sid,index:row.index,input:row.in,ts:record.ts,correct:row.correct,learningCorrect:row.correct,reviewRequired:row.reviewRequired,reviewReasons:row.reviewReasons,reviewPending:row.reviewPending,reviewEvents:reviewEvents(source,record.id,rowIndex),occurrenceId:referenceId(record.id,rowIndex)});
     });
     for(const word of words){
-      const saved=Object.hasOwn(stored,word)?stored[word]:{},entry=evidenceEntry(word,saved),rows=byWord.get(word)||[],errors=rows.filter(v=>v.correct===false),sources=new Map(),legacy=[],unresolved=[];let missing=false;
-      const sourceFor=value=>{const id=stableJSON([value.sid,value.index,word]);if(!sources.has(id))sources.set(id,{sid:value.sid,index:value.index,w:word,n:0,occurrences:[],pending:false,manual:false});return sources.get(id);};
-      for(const row of errors){const source=sourceFor(row);source.n++;source.occurrences.push({...row,type:'history'});}
+      const saved=Object.hasOwn(stored,word)?stored[word]:{},entry=evidenceEntry(word,saved),rows=byWord.get(word)||[],errors=rows.filter(v=>v.correct===false),reviews=rows.filter(needsReview),sources=new Map(),legacy=[],unresolved=[];let missing=false;
+      const sourceFor=value=>{const id=stableJSON([value.sid,value.index,word]);if(!sources.has(id))sources.set(id,{sid:value.sid,index:value.index,w:word,n:0,reviewRows:0,occurrences:[],pending:false,manual:false});return sources.get(id);};
+      for(const row of reviews){const source=sourceFor(row);if(row.correct===false)source.n++;source.reviewRows++;source.occurrences.push({...row,type:'history'});}
       let matched=false;
       const identified=new Set(),rowInputs=new Map();
       for(const snapshot of Object.values(entry.legacySnapshots)){const id=legacyRowId(snapshot);if(id){if(!rowInputs.has(id))rowInputs.set(id,new Set());rowInputs.get(id).add(snapshot.in);}}
@@ -2635,49 +2767,31 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
         if(!snapshot.hasInput||typeof snapshot.in!=='string'){missing=true;source.pending=true;const value={...snapshot,id,state:'missing-input',type:'legacy',occurrenceId:'legacy:'+id};unresolved.push(value);source.occurrences.push(value);continue;}
         const rowId=legacyRowId(snapshot);
         if(rowId&&rowInputs.get(rowId).size>1){source.pending=true;const value={...snapshot,id,state:'conflicting-source',type:'legacy',occurrenceId:'legacy:'+id};unresolved.push(value);source.occurrences.push(value);continue;}
-        if(scoreGrade(snapshot.in,word,{ignoreCase:true,looseRules:true},rules).correct)continue;
+        const grade=scoreGrade(snapshot.in,word,{ignoreCase:true,looseRules:true},rules);
+        if(!grade.reviewRequired)continue;
         if(rowId&&identified.has(rowId))continue;if(rowId)identified.add(rowId);
         const matches=rows.filter(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.evidence?row.recordId===snapshot.evidence.recordId&&row.rowIndex===snapshot.evidence.rowIndex:Number.isFinite(snapshot.ts)&&row.ts===snapshot.ts&&Number.isInteger(snapshot.index)&&row.index===snapshot.index));
         if(matches.length===1){matched=true;continue;}
-        const possible=errors.some(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.index===undefined||row.index===snapshot.index))||!rowId&&Object.values(entry.legacySnapshots).some(other=>legacyRowId(other)&&other.sid===snapshot.sid&&other.index===snapshot.index&&other.in===snapshot.in);
-        const value={...snapshot,id,state:possible?'unresolved-link':'independent',input:snapshot.in,occurrenceId:'legacy:'+(rowId||id),type:'legacy',counted:false};source.occurrences.push(value);
+        const possible=reviews.some(row=>row.input===snapshot.in&&row.sid===snapshot.sid&&(snapshot.index===undefined||row.index===snapshot.index))||!rowId&&Object.values(entry.legacySnapshots).some(other=>legacyRowId(other)&&other.sid===snapshot.sid&&other.index===snapshot.index&&other.in===snapshot.in);
+        const value={...snapshot,id,state:possible?'unresolved-link':'independent',input:snapshot.in,correct:grade.correct,learningCorrect:grade.correct,reviewRequired:grade.reviewRequired,reviewReasons:grade.reviewReasons,reviewPending:grade.reviewPending,reviewEvents:reviewEvents({...snapshot,...grade,w:word,in:snapshot.in},undefined,undefined,rowId||id),occurrenceId:'legacy:'+(rowId||id),type:'legacy',counted:false};source.occurrences.push(value);
         if(possible)source.pending=true;
         (possible?unresolved:legacy).push(value);
       }
       // Distinct bundled rows each count once. Unidentified cumulative snapshots
       // establish at most one additional old error per original question source.
       const cumulative=new Set();
-      for(const snapshot of legacy.slice().sort((a,b)=>(b.ts||0)-(a.ts||0)||a.id.localeCompare(b.id))){const source=sourceFor(snapshot);if(legacyRowId(snapshot)){source.n++;snapshot.counted=true;}else if(!cumulative.has(source)){source.n++;snapshot.counted=true;cumulative.add(source);}}
+      for(const snapshot of legacy.slice().sort((a,b)=>(b.ts||0)-(a.ts||0)||a.id.localeCompare(b.id))){const source=sourceFor(snapshot);if(legacyRowId(snapshot)||!cumulative.has(source)){if(snapshot.correct===false)source.n++;source.reviewRows++;snapshot.counted=true;if(!legacyRowId(snapshot))cumulative.add(source);}}
       for(const source of Object.values(entry.manualSources||{})){const item=sourceFor(source);item.manual=true;}
-      const n=[...sources.values()].reduce((sum,source)=>sum+source.n,0),manual=[...sources.values()].some(v=>v.manual),pending=!n&&!manual&&missing;
-      if(!n&&!manual&&!pending&&!unresolved.length)continue;
-      result[word]=projectWrong({...saved,mastered:!!entry.mastery?.value,sources:[...sources.values()].filter(v=>v.n||v.manual||v.pending||v.occurrences.length),provenance:{historyErrors:errors.length,legacy:unresolved.some(v=>v.state==='conflicting-source')?'conflicting-source':unresolved.some(v=>v.state==='unresolved-link')?'unresolved-link':legacy.length?'independent':missing?'missing-input':matched?'matched':manual?'manual':'none'}});
+      for(const source of sources.values()){Object.assign(source,reviewCounts(source.occurrences),{rowErrors:source.n,reviewRequired:source.reviewRows>0,reviewPending:source.occurrences.some(row=>(row.type==='history'||row.counted)&&row.reviewPending)});}
+      const reviewRows=[...sources.values()].reduce((sum,source)=>sum+source.reviewRows,0),manual=[...sources.values()].some(v=>v.manual),pending=!reviewRows&&!manual&&missing;
+      if(!reviewRows&&!manual&&!pending&&!unresolved.length)continue;
+      result[word]=projectWrong({...saved,mastered:!!entry.mastery?.value,sources:[...sources.values()].filter(v=>v.reviewRows||v.manual||v.pending||v.occurrences.length),provenance:{historyErrors:errors.length,historyReviewRows:reviews.length,legacy:unresolved.some(v=>v.state==='conflicting-source')?'conflicting-source':unresolved.some(v=>v.state==='unresolved-link')?'unresolved-link':legacy.length?'independent':missing?'missing-input':matched?'matched':manual?'manual':'none'}});
     }
     return result;
   }
+  // Compatibility entry point uses the same append-only evidence model as submission.
   function updateWrong(previous, record) {
-    const result = JSON.parse(JSON.stringify(previous));
-    record.rows.forEach((row,rowIndex) => {
-      const sid = row.sid || record.sid;
-      // Migrate an explicitly renamed entry only at its original chapter/index.
-      for (const previous of row.previousWords || []) {
-        const old = result[previous];
-        if (previous === row.w || old?.sid !== sid || old.index !== row.index) continue;
-        const current = result[row.w];
-        result[row.w] = { ...old, ...(current || {}), n: old.n + (current?.n || 0) };
-        delete result[previous];
-      }
-      if (row.correct ?? row.loose) {
-        if (result[row.w]?.sid === sid) {
-          result[row.w].n = Math.max(0, result[row.w].n - 1);
-          if (!result[row.w].n) delete result[row.w];
-        }
-      } else {
-        const old = result[row.w];
-        result[row.w] = { sid, index: row.index, n: (old?.n || 0) + 1, ts: record.ts, in: row.in, mastered: false,evidence:{recordId:record.id,rowIndex} };
-      }
-    });
-    return result;
+    return mutateWrong(previous,{type:'record',record,now:record.ts});
   }
   function itemForRow(data, row, fallbackSid) {
     const sid = row.sid || fallbackSid, words = data.words[sid] || [];
@@ -2687,7 +2801,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return index < 0 ? null : { ...words[index], sid, index };
   }
   function retryItems(data, record) {
-    return record.rows.flatMap((row,rowIndex)=>{if(row.correct!==false)return [];const item=itemForRow(data,row,record.sid);return item?[{...item,recordId:record.id,rowIndex,occurrenceId:JSON.stringify([record.id,rowIndex])}]:[];});
+    return record.rows.flatMap((row,rowIndex)=>{if(!needsReview(row))return [];const item=itemForRow(data,row,record.sid);return item?[{...item,recordId:record.id,rowIndex,occurrenceId:JSON.stringify([record.id,rowIndex])}]:[];});
   }
   function learnedCount(records) {
     const seen = new Set();
@@ -2730,10 +2844,9 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function learningContinuation(data, records, drafts = []) {
     const sections = orderedSections(data), history = records.filter(isDictationRecord);
-    const completedIds = new Set(history.map(record => record.id));
     // Callers order drafts with the current attempt first. Completed mirrors
     // must not send the learner back into an already submitted attempt.
-    const draft = drafts.find(draft => !completedIds.has(draft.id) && draft.items?.some(item => itemForRow(data,item,draft.sid)));
+    const draft = drafts.find(draft => !completedDraftMirror(draft,history) && draft.items?.some(item => itemForRow(data,item,draft.sid)));
     if (draft) return {sid: draft.sid, draftId: draft.id};
     const covered = new Map(sections.map(section => [section.id,new Set()]));
     for (const record of history) for (const row of record.rows) {
@@ -2769,7 +2882,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return { total: data.words[sid]?.length || 0, practiced: practiced.size,
       attempts: history.length, last: history.at(-1) || null, drafts: saved };
   }
-  return { projectWrong,legacyRowId,validWrongEntry,evidenceEntry,mergeEvidence,mutateWrong,mergeRecords,referenceId,stableJSON,sourceRecord,originalImmediate,ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
+  return { mergeJournalExtras,validDraft,mergeDrafts,draftMatchesRecord,completedDraftMirror,materializeBackup,tokens,occurrencesForRow,reviewEventId, projectWrong,legacyRowId,validWrongEntry,evidenceEntry,mergeEvidence,mutateWrong,mergeRecords,referenceId,stableJSON,sourceRecord,originalImmediate,ruleSignature, recordView, historyViews, deriveWrong, ANALYSIS_VERSION, formatEquivalent, canonicalSpelling, analyzeRecord, answerForms, learningContinuation, nextSection, recordSection, scoreGrade, regradeRecord, chapterProgress, draftAnswered, practicePauseMs, normalize, fold, grade, itemsFor, shuffled, makeRecord, updateWrong, itemForRow, retryItems, learnedCount, forSection };
 });
 
 </script>
@@ -2781,62 +2894,29 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   else root.DictationWrongFrequency=factory(root.DictationCore);
 })(typeof globalThis!=='undefined'?globalThis:this,function(C){
   'use strict';
-  const tokens=value=>C.normalize(value).match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*(?:-[\p{L}\p{N}]+)*/gu)||[];
+  const tokens=C.tokens,occurrencesForRow=C.occurrencesForRow;
   const modes=new Set(['normal','dictation','shuffle','wrong']);
-  function distance(a,b){let prev=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){const next=[i];for(let j=1;j<=b.length;j++)next[j]=Math.min(prev[j]+1,next[j-1]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));prev=next;}return prev[b.length];}
-  const same=(input,answer,settings,rules)=>C.scoreGrade(input,answer,{...settings,looseRules:true},rules).assessment.learningCorrect;
   const keyFor=(word,rules)=>C.canonicalSpelling(word,rules,true);
   const dayKey=ts=>{const d=new Date(ts);return [d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-');};
-  // Collect attribution from EVERY minimum-cost path, without enumerating paths.
-  function align(expected,actual,settings,rules){
-    const n=expected.length,m=actual.length;
-    if(n>64||m>64||expected.join('').length>512||actual.join('').length>512)return {cost:Infinity,rows:expected.map(word=>({word,input:'',verdict:'pending',reason:'输入过长，待确认'}))};
-    const edges=Array.from({length:n+1},()=>Array.from({length:m+1},()=>[])),forward=Array.from({length:n+1},()=>Array(m+1).fill(Infinity)),back=Array.from({length:n+1},()=>Array(m+1).fill(Infinity));
-    for(let i=0;i<=n;i++)for(let j=0;j<=m;j++){
-      const add=(di,dj,cost,values)=>edges[i][j].push({i:i+di,j:j+dj,cost,values});
-      if(i<n&&j<m){const ok=same(actual[j],expected[i],settings,rules);const cost=ok?0:10+Math.min(9,Math.round(9*distance(C.fold(actual[j]),C.fold(expected[i]))/Math.max(expected[i].length,actual[j].length,1)));add(1,1,cost,[{at:i,input:actual[j],verdict:ok?'correct':'incorrect',reason:ok?'标准 / 合法变体':'拼写差异',owner:j}]);}
-      if(i<n)add(1,0,10,[{at:i,input:'',verdict:'omission',reason:'漏写',owner:-1}]);
-      if(j<m)add(0,1,10,[]);
-      for(const [di,dj] of [[2,1],[1,2],[3,1],[1,3],[4,1],[1,4]])if(i+di<=n&&j+dj<=m){
-        const left=expected.slice(i,i+di).join(' '),right=actual.slice(j,j+dj).join(' '),a=C.fold(left).replace(/[ -]/g,''),b=C.fold(right).replace(/[ -]/g,'');
-        const legal=same(right,left,settings,rules),d=distance(a,b);
-        const compare=settings.ignoreCase?C.fold:C.normalize;
-        const anchored=expected.slice(i,i+di).some(word=>actual.slice(j,j+dj).some(input=>compare(word)===compare(input)));
-        // Unlisted split/join guesses must not consume a complete exact word.
-        if(!legal&&anchored)continue;
-        if(legal||d/Math.max(a.length,b.length,1)<=.25)add(di,dj,legal?0:8+Math.min(9,d),expected.slice(i,i+di).map((word,k)=>({at:i+k,input:right,verdict:legal?'correct':'pending',reason:legal?'合法变体 / 学习格式容差':'拆合词边界待确认',owner:j})));
-      }
-    }
-    forward[0][0]=0;for(let i=0;i<=n;i++)for(let j=0;j<=m;j++)for(const e of edges[i][j])forward[e.i][e.j]=Math.min(forward[e.i][e.j],forward[i][j]+e.cost);
-    back[n][m]=0;for(let i=n;i>=0;i--)for(let j=m;j>=0;j--)for(const e of edges[i][j])back[i][j]=Math.min(back[i][j],e.cost+back[e.i][e.j]);
-    const choices=expected.map(()=>new Map());for(let i=0;i<=n;i++)for(let j=0;j<=m;j++)for(const e of edges[i][j])if(forward[i][j]+e.cost+back[e.i][e.j]===forward[n][m])for(const value of e.values)choices[value.at].set(JSON.stringify([value.owner,value.input,value.verdict]),value);
-    return {cost:forward[n][m],rows:expected.map((word,i)=>{const values=[...choices[i].values()];return values.length===1?{word,...values[0]}:{word,input:'',verdict:'pending',reason:'多个等价对齐，归属待确认'};})};
-  }
-  function occurrencesForRow(input,answer,settings,rules={}){
-    const actual=tokens(input),candidates=C.answerForms(answer).map(form=>align(tokens(form),actual,settings,rules));
-    const cost=Math.min(...candidates.map(c=>c.cost)),best=candidates.filter(c=>c.cost===cost),first=best[0];if(!first)return [];
-    if(best.every(c=>c.rows.length===first.rows.length&&c.rows.every((v,i)=>v.input===first.rows[i].input&&v.verdict===first.rows[i].verdict&&v.owner===first.rows[i].owner&&same(v.word,first.rows[i].word,settings,rules))))return first.rows;
-    return first.rows.map(row=>({...row,verdict:'pending',reason:'可选答案身份待确认'}));
-  }
   function mistakes(input,answer,settings,rules={}){return occurrencesForRow(input,answer,settings,rules).filter(v=>['incorrect','omission'].includes(v.verdict)).map(v=>({word:keyFor(v.word,rules),input:v.input}));}
   function profiles(records,rules={}){
     const words=new Map(),seen=new Set(),parsed=new Map(),unattributedPending=[];
     for(const record of records){
       if(!record||!modes.has(record.mode)||!Array.isArray(record.rows)||typeof record.id!=='string'||seen.has(record.id))continue;seen.add(record.id);
-      const settings={ignoreCase:record.ignoreCase!==false,looseRules:true};
+      const settings={ignoreCase:true,looseRules:true};
       record.rows.forEach((row,rowIndex)=>{
         if(!row||typeof row.w!=='string'){unattributedPending.push({recordId:record.id,rowIndex,sid:row?.sid||record.sid,reason:'missing-answer'});return;}
         const signature=JSON.stringify([row.w,row.in,settings.ignoreCase]);if(!parsed.has(signature)){
           if(typeof row.in==='string')parsed.set(signature,occurrencesForRow(row.in,row.w,settings,rules));
           else {const forms=C.answerForms(row.w).map(tokens),first=forms[0]||[],identical=forms.every(form=>form.length===first.length&&form.every((word,i)=>keyFor(word,rules)===keyFor(first[i],rules)));
-            parsed.set(signature,identical?first.map(word=>({word,input:null,verdict:'pending',reason:'missing-input'})):[]);
+            parsed.set(signature,identical?first.map((word,tokenIndex)=>({word,expected:word,tokenIndex,input:null,verdict:'pending',reason:'missing-input',pending:true,pendingReason:'missing-input',learningCorrect:null,reviewRequired:false,reviewReasons:[]})):[]);
           }
         }
         if(!parsed.get(signature).length){unattributedPending.push({recordId:record.id,rowIndex,sid:row.sid||record.sid,context:row.w,reason:'optional-answer-identity'});return;}
         const phrase=tokens(C.answerForms(row.w)[0]).length>1;
         parsed.get(signature).forEach((value,tokenIndex)=>{
           const word=keyFor(value.word,rules);if(!word)return;if(!words.has(word))words.set(word,[]);
-          words.get(word).push({id:record.id+':'+rowIndex+':'+tokenIndex,recordId:record.id,word,expected:value.word,input:value.input,verdict:value.verdict,reason:value.reason,sid:row.sid||record.sid,index:row.index,context:row.w,rawInput:typeof row.in==='string'?row.in:null,sourceType:phrase?'phrase':'standalone',ts:record.ts||0,day:dayKey(record.ts||0),rowIndex,tokenIndex});
+          words.get(word).push({id:C.reviewEventId(record.id,rowIndex,tokenIndex),recordId:record.id,word,expected:value.word,input:value.input,verdict:value.verdict,reason:value.reason,learningCorrect:value.learningCorrect,reviewRequired:value.reviewRequired,reviewReasons:value.reviewReasons.slice(),pendingReason:value.pendingReason,sid:row.sid||record.sid,index:row.index,context:row.w,rawInput:typeof row.in==='string'?row.in:null,sourceType:phrase?'phrase':'standalone',ts:record.ts||0,day:dayKey(record.ts||0),rowIndex,tokenIndex});
         });
       });
     }
@@ -2844,20 +2924,24 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function summarize(word,occurrences){
     occurrences=occurrences.slice().sort((a,b)=>a.ts-b.ts||a.recordId.localeCompare(b.recordId)||a.rowIndex-b.rowIndex||a.tokenIndex-b.tokenIndex);
+    const reviews=occurrences.filter(v=>v.reviewRequired),count=reason=>reviews.filter(v=>v.reviewReasons.includes(reason)).length;
+    const spellingCount=count('spelling'),omissionCount=count('omission'),homophoneCount=count('homophone'),reviewCount=spellingCount+omissionCount+homophoneCount;
     const valid=occurrences.filter(v=>v.verdict!=='pending'),correct=valid.filter(v=>v.verdict==='correct').length,incorrect=valid.length-correct,pending=occurrences.length-valid.length,typos=new Map(),sources=new Map();
     const stats=kind=>{const rows=occurrences.filter(v=>v.sourceType===kind),ok=rows.filter(v=>v.verdict==='correct').length,bad=rows.filter(v=>['incorrect','omission'].includes(v.verdict)).length;return {correct:ok,incorrect:bad,total:ok+bad,pending:rows.length-ok-bad};};
     for(const v of occurrences){
-      const id=JSON.stringify([v.sid,v.index,v.context]);if(!sources.has(id))sources.set(id,{sid:v.sid,index:v.index,w:v.context,n:0,total:0,correct:0,pending:0,phrase:v.sourceType==='phrase',in:'',tokenInput:'',ts:-Infinity});const source=sources.get(id);
+      const id=JSON.stringify([v.sid,v.index,v.context]);if(!sources.has(id))sources.set(id,{sid:v.sid,index:v.index,w:v.context,n:0,total:0,correct:0,pending:0,reviewCount:0,spellingCount:0,omissionCount:0,homophoneCount:0,reviewReasons:[],phrase:v.sourceType==='phrase',in:'',tokenInput:'',ts:-Infinity});const source=sources.get(id);
+      if(v.reviewRequired){source.lastReview=v;source.reviewCount++;for(const reason of v.reviewReasons){source[reason+'Count']++;if(!source.reviewReasons.includes(reason))source.reviewReasons.push(reason);}}
       if(v.verdict==='pending')source.pending++;else {source.total++;if(v.verdict==='correct')source.correct++;else {source.n++;typos.set(v.input,(typos.get(v.input)||0)+1);}}
       if(v.ts>=source.ts){source.in=v.rawInput;source.tokenInput=v.input;source.ts=v.ts;}
     }
     const days=new Set(valid.map(v=>v.day)),last=valid.at(-1),lastSix=valid.slice(-6),span=valid.length?(valid.at(-1).ts-valid[0].ts)/86400000:0;
     let status='数据不足';
-    if(valid.length>=8&&days.size>=3&&span>=7&&lastSix.length===6&&lastSix.every(v=>v.verdict==='correct')&&new Set(lastSix.map(v=>v.day)).size>=2)status='基本掌握';
+    if(valid.length>=8&&days.size>=3&&span>=7&&lastSix.length===6&&lastSix.every(v=>v.verdict==='correct'&&!v.reviewRequired)&&new Set(lastSix.map(v=>v.day)).size>=2)status='基本掌握';
     else if(valid.length>=6&&days.size>=3){
       const fixed=[...typos].some(([input,n])=>input&&n>=3&&new Set(valid.filter(v=>v.input===input&&v.verdict!=='correct').map(v=>v.day)).size>=2);
       if(fixed&&last?.verdict!=='correct')status='固化错误';else if(correct&&incorrect)status='不稳定';
     }
+    const latestReview=reviews.at(-1);
     const latestError=valid.filter(v=>v.verdict!=='correct').at(-1),standaloneStats=stats('standalone'),phraseStats=stats('phrase');
     const latestRound=valid.at(-1)?.recordId,round=valid.filter(v=>v.recordId===latestRound);
     const roundCorrect=round.filter(v=>v.verdict==='correct').length,roundIncorrect=round.length-roundCorrect;
@@ -2874,10 +2958,10 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if(correctStreak>=2)observe('correct-streak','最近连续正确（'+correctStreak+'次）');
     const shortTerm={latestRound,roundCorrect,roundIncorrect,roundMixed:!!(roundCorrect&&roundIncorrect),mixed:!!(correct&&incorrect),repeatedTypos,correctStreak};
 
-    return {word,expected:occurrences[0]?.expected||word,n:incorrect,correct,total:valid.length,pending,coverage:occurrences.length?Math.round(valid.length/occurrences.length*1000)/10:0,accuracy:valid.length?Math.round(correct/valid.length*1000)/10:null,observations,shortTerm,typos:[...typos].map(([input,n])=>({input,n})).sort((a,b)=>b.n-a.n||a.input.localeCompare(b.input)),status,standalone:standaloneStats.incorrect,phrases:phraseStats.incorrect,standaloneStats,phraseStats,lastInput:latestError?.input||'',lastCorrect:valid.filter(v=>v.verdict==='correct').at(-1)||null,lastIncorrect:latestError||null,occurrences,sources:[...sources.values()].sort((a,b)=>b.n-a.n||Number(a.phrase)-Number(b.phrase)||a.w.localeCompare(b.w))};
+    return {word,expected:occurrences[0]?.expected||word,n:incorrect,spellingCount,omissionCount,homophoneCount,reviewCount,reviewRequired:reviewCount>0,reviewReasons:['homophone','spelling','omission'].filter(reason=>count(reason)>0),lastReview:latestReview||null,correct,total:valid.length,pending,coverage:occurrences.length?Math.round(valid.length/occurrences.length*1000)/10:0,accuracy:valid.length?Math.round(correct/valid.length*1000)/10:null,observations,shortTerm,typos:[...typos].map(([input,n])=>({input,n})).sort((a,b)=>b.n-a.n||a.input.localeCompare(b.input)),status,standalone:standaloneStats.incorrect,phrases:phraseStats.incorrect,standaloneStats,phraseStats,lastInput:latestError?.input||'',lastCorrect:valid.filter(v=>v.verdict==='correct').at(-1)||null,lastIncorrect:latestError||null,occurrences,sources:[...sources.values()].sort((a,b)=>b.reviewCount-a.reviewCount||b.n-a.n||Number(a.phrase)-Number(b.phrase)||a.w.localeCompare(b.w))};
   }
-  const rank=(a,b)=>b.n-a.n||a.word.localeCompare(b.word);
-  const aggregate=(records,rules={})=>profiles(records,rules).filter(entry=>entry.n>0);
+  const rank=(a,b)=>b.reviewCount-a.reviewCount||b.n-a.n||a.word.localeCompare(b.word);
+  const aggregate=(records,rules={})=>profiles(records,rules).filter(entry=>entry.reviewCount>0);
   function filter(list,sid='all',query=''){const search=C.fold(query);return list.filter(e=>e.word.includes(search)).map(e=>summarize(e.word,e.occurrences.filter(v=>sid==='all'||v.sid===sid))).filter(e=>e.occurrences.length).sort(rank);}
   function reviewProfiles(list,source){
     return list.filter(entry=>source==='same-typo'?entry.shortTerm.repeatedTypos.length>0:
@@ -2889,13 +2973,15 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if(options.dedupe===false){
       // Count original questions, not each wrong token in the same phrase.
       for(const entry of list)for(const occurrence of entry.occurrences){
-        if(!['incorrect','omission'].includes(occurrence.verdict))continue;
+        if(!occurrence.reviewRequired||options.reason&&options.reason!=='all'&&!occurrence.reviewReasons.includes(options.reason))continue;
         const rowKey=JSON.stringify([occurrence.recordId,occurrence.rowIndex]);if(seen.has(rowKey))continue;
         const item=C.itemForRow(data,{w:occurrence.context,sid:occurrence.sid,index:occurrence.index},occurrence.sid);
         if(item){seen.add(rowKey);items.push({...item,recordId:occurrence.recordId,rowIndex:occurrence.rowIndex,occurrenceId:rowKey});}
       }
     }else for(const entry of list)for(const source of entry.sources){
-      if(!source.n)continue;const item=C.itemForRow(data,source,source.sid),key=item&&JSON.stringify([item.sid,item.index]);
+      if(!source.reviewCount&&!source.n)continue;
+      if(options.reason&&options.reason!=='all'&&!entry.occurrences.some(value=>value.sid===source.sid&&value.index===source.index&&value.context===source.w&&value.reviewRequired&&value.reviewReasons.includes(options.reason)))continue;
+      const item=C.itemForRow(data,source,source.sid),key=item&&JSON.stringify([item.sid,item.index]);
       if(item&&!seen.has(key)){seen.add(key);items.push(item);}
     }
     return items;
@@ -3003,7 +3089,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function retryItems(data, entries) {
     const seen=new Set(),items=[];
     for(const [word,info]of entries)for(const source of info.sources?.length?info.sources:[info]){
-      if(info.sources?.length ? !source.n&&!source.manual : source.pending&&!source.n&&!source.manual)continue;
+      if(info.sources?.length ? !(source.reviewRequired||source.reviewRows||source.n||source.manual) : source.pending&&!(source.reviewRequired||source.reviewRows||source.n||source.manual))continue;
       const words=data.words[source.sid]||[],index=Number.isInteger(source.index)&&(words[source.index]?.w===word||words[source.index]?.previousWords?.includes(word))?source.index:words.findIndex(item=>item.w===word),id=JSON.stringify([source.sid,index]);
       if(index<0||seen.has(id))continue;seen.add(id);items.push({...words[index],sid:source.sid,index,sourceOccurrences:(source.occurrences||[]).filter(value=>value.type!=='legacy'||value.counted)});
     }return items;
@@ -3022,6 +3108,14 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return queue;
   }
   // Paper practice has an independent cancellation generation and never creates scores.
+  function restoredPaper(core,data,saved) {
+    if(!saved||!Array.isArray(saved.items))return null;
+    const kept=saved.items.flatMap((item,oldIndex)=>{const resolved=item&&core.itemForRow(data,item,item.sid);return resolved?[{item:{...item,...resolved},oldIndex}]:[];});
+    if(!kept.length)return null;
+    const selected=Math.max(0,Math.min(saved.items.length-1,Number.isInteger(saved.idx)?saved.idx:0)),at=kept.findIndex(value=>value.oldIndex>=selected),self={};
+    kept.forEach((value,index)=>{if(['已掌握','仍不会'].includes(saved.self?.[value.oldIndex]))self[index]=saved.self[value.oldIndex];});
+    return {...saved,items:kept.map(value=>value.item),idx:at<0?kept.length-1:at,self,rate:[1,1.25,1.4,1.6].includes(saved.rate)?saved.rate:1,interval:[0,.5,1].includes(saved.interval)?saved.interval:0,loop:!!saved.loop,revealed:false,status:'待播放'};
+  }
   function paperPlayer({play, cancel, wait, update = () => {}}) {
     let generation = 0, state = null;
     const stop = () => { generation++; cancel(); if (state) { state.status = '已停止'; update(state); } };
@@ -3051,7 +3145,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       if(dedupe&&seen.has(value))return false;seen.add(value);return true;
     }).join('\n');
   }
-  return { answerText, paperQueue, paperPlayer, identity, reviewedClip, playbackClip, chapterReview, practiceItems, kindFor, playbackRateFor, correctionKey, queueCorrection, correctionResponse, localApiAvailable, safeReviewUrl, mergeFeatureBackup, retryItems };
+  return { restoredPaper,answerText, paperQueue, paperPlayer, identity, reviewedClip, playbackClip, chapterReview, practiceItems, kindFor, playbackRateFor, correctionKey, queueCorrection, correctionResponse, localApiAvailable, safeReviewUrl, mergeFeatureBackup, retryItems };
 });
 
 </script>
@@ -3157,7 +3251,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
 </script>
 <!-- Inlined: app.js -->
 <script>
-(() => {
+window.DictationReady = (async () => {
   'use strict';
   const D = window.DICT_DATA, TL = window.DICT_TIMELINE || {}, RULES = window.DICT_RULES || {};
   const C = window.DictationCore, F = window.DictationFeatures, $ = selector => document.querySelector(selector);
@@ -3174,6 +3268,9 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   keys.feedbackDraft = key('dict3_feedback_draft');
   keys.paper = key('dict3_paper_draft');
   keys.pendingWrite = key('dict3_evidence_pending');
+  const clone=value=>JSON.parse(JSON.stringify(value));
+  const newIdentity=()=>window.crypto.randomUUID();
+  const evidenceLock=key('dict3-evidence-transaction');
   const read = (name, fallback) => { try { return JSON.parse(localStorage.getItem(keys[name])) ?? fallback; } catch { return fallback; } };
   function save(name, value) { try { localStorage.setItem(keys[name], JSON.stringify(value)); return true; } catch { toast('浏览器存储空间不足，请先导出备份。'); return false; } }
   const defaults = { profileVersion: 2, preset: '强化', rate: 1.4, interval: 5, repeat: 1, submit: 'manual', ignoreCase: true, showFeedback: true, showCorrectAnswer: false, autoNext: false, looseRules: true, showSrc: false, showMean: false, immerse: false };
@@ -3183,12 +3280,12 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   const chapterNames = { C3: '名词专项', C4: '形容词与副词', C5: '吞音连读词组', C11: '综合语料训练' };
   const modeNames = { normal: '听写模式', dictation: '听写模式', shuffle: '乱序听写', wrong: '错词重练', radio: '电台模式', mark: '标记错词', match: '消消乐', legacy: '旧版错词记录' };
   const routes = { library: '我的单词本', wrong: '错词复习', statistics: '学习统计', settings: '学习设置', feedback: '报告问题' };
-  let route = 'library', chapterFilter = 'all', search = '', wrongFilter = 'pending', wrongChapter = 'all', wrongSearch = '', statsFilter = 'all', onlyRecords = false;
+  let route = 'library', chapterFilter = 'all', search = '', wrongFilter = 'pending', wrongReason = 'all', wrongChapter = 'all', wrongSearch = '', statsFilter = 'all', onlyRecords = false;
+  let initialized=false,finishing=false;
   let session = null, result = null, setup = null, game = null, tickTimer, toastTimer, modalReturnFocus;
   let draftToDelete = null;
   let resultFilter = 'all', resultFilterId = null;
   let audioToken = 0, audioCleanups = [], playing = false;
-  let feedbackSession = null, feedbackGrading = '';
   let practiceResizeObserver, practiceViewportFrame = null, practiceViewportSignature = '';
   let vocabularyTypes = read('vocabularyTypes', {}), audioCorrections = read('audioCorrections', []), correctionDialog = null;
   if (!vocabularyTypes || typeof vocabularyTypes !== 'object' || Array.isArray(vocabularyTypes)) vocabularyTypes = {};
@@ -3352,7 +3449,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
 
   function library() {
     const learned = C.learnedCount(currentRecords()), storedDraft = read('draft', null), today = dayRecords();
-    const draft = validDraft(storedDraft) && !records.some(r => r.id === storedDraft.id) ? storedDraft : null;
+    const draft = validDraft(storedDraft) && !C.completedDraftMirror(storedDraft,records) ? storedDraft : null;
     const continuation = C.learningContinuation(D, currentRecords(), allDrafts());
     const continuationHint = continuation ? `${continuation.draftId ? '继续未完成练习' : '接下来'} · ${titleOf(continuation.sid)}${continuation.indices ? ` · 剩余 ${continuation.indices.length} 词` : ''}` : '全部章节已完成，可在下方选择章节复习';
     return heading('我的单词本', '从听见到听懂，让每一次练习都有收获。', `<span class="date">${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })}</span>${button(icon('chart', 15) + ' 学习报告', 'route', 'data-route="statistics"')}`) +
@@ -3371,7 +3468,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function continueNextSection() {
     const next = C.nextSection(D, result);
     if (!next) return;
-    const draft = allDrafts().find(d => !records.some(r => r.id === d.id) && d.items.every(item => item.sid === next.id));
+    const draft = allDrafts().find(d => !C.completedDraftMirror(d,records) && d.items.every(item => item.sid === next.id));
     if (draft) resume(draft.id);
     else openSetup(next.id);
   }
@@ -3396,28 +3493,47 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       }).join('')}</div>`;
     }).join('');
   }
+  const reasonLabels={homophone:'同音混淆',spelling:'拼写错误',omission:'漏写'};
+  const matchesReason=(value,reason=wrongReason)=>reason==='all'||(value.reviewReasons||[]).includes(reason);
+  const reasonText=value=>(value.reviewReasons||[]).map(reason=>reasonLabels[reason]).filter(Boolean).join('、');
+  const reasonBadges=value=>(value.reviewReasons||[]).map(reason=>'<span class="badge review-reason" data-review-reason="'+reason+'">'+reasonLabels[reason]+'</span>').join(' ');
+  const reviewSummary=value=>'词级复习 '+(value.reviewCount||0)+' 次 · 同音 '+(value.homophoneCount||0)+' · 拼写 '+(value.spellingCount||0)+' · 漏写 '+(value.omissionCount||0);
+  const confirmedOccurrence=value=>value.type==='history'||value.type==='legacy'&&value.counted;
+  function scopedReviewEntries(entries){
+    if(wrongReason==='all')return entries;
+    return entries.map(([word,entry])=>[word,{...entry,sources:entry.sources.map(source=>{
+      const occurrences=(source.occurrences||[]).filter(value=>confirmedOccurrence(value)&&matchesReason(value));
+      return {...source,occurrences,reviewRows:occurrences.length,reviewRequired:occurrences.length>0,manual:false};
+    }).filter(source=>source.occurrences.length)}]).filter(([,entry])=>entry.sources.length);
+  }
+  function latestEntryReview(entry){return entry.sources.flatMap(source=>source.occurrences||[]).filter(value=>confirmedOccurrence(value)&&matchesReason(value)).sort((a,b)=>(a.ts||0)-(b.ts||0)||(a.recordId===b.recordId?(a.rowIndex||0)-(b.rowIndex||0):0)||String(a.occurrenceId).localeCompare(String(b.occurrenceId))).at(-1);}
+  function entryPresentation(entry){
+    const sources=wrongReason==='all'?entry.sources:scopedReviewEntries([['',entry]])[0]?.[1].sources||[],latest=latestEntryReview(entry);
+    return {latest,input:latest?.input??entry.in,sids:[...new Set(sources.map(source=>source.sid))]};
+  }
+  function frequencyItems(list,options={}){return W.practiceItems(D,list,{...options,reason:wrongReason});}
   function wrongPage() {
     const frequent = wrongFilter === 'frequency', frequency = filteredFrequency();
-    const reviewCount=frequent?W.practiceItems(D,frequency).length:filteredReviewItems().length;
+    const reviewCount=frequent?frequencyItems(frequency).length:filteredReviewItems().length;
     return heading('错词复习', '把不熟悉的，再听一次。每个错词都是进步的起点。', button('听音默写','paper-setup','','primary') + button('正确答案 TXT','answers-txt') + button(icon('download', 15) + (frequent ? ' 导出统计' : ' 导出错词'), frequent ? 'export-frequency' : 'export-wrong')) +
-      `<div class="wrong-banner panel">${icon('edit', 30)}<div class="grow"><h2>${wrongBannerTitle()}</h2><p>${frequent ? '单词与词组中的同一错词合并累计；可查看来源并复习对应原词条。' : '听写结束后自动收录错词，支持按章节复习与标记掌握。'}</p></div>${button(icon('play', 14) + (frequent ? ' 按高频复习' : ' 开始复习'), 'review-all', reviewCount ? '' : 'disabled', 'primary')}</div><div class="toolbar wrong-toolbar"><div class="segmented" aria-label="错词状态">${[['pending','待复习'],['uncertain','待确认'],['mastered','已掌握'],['frequency','高频错词']].map(([v, label]) => `<button class="${wrongFilter === v ? 'active' : ''}" data-act="wrong-filter" data-value="${v}">${label} <small data-wrong-count="${v}">${v==='frequency'?filteredFrequency().length:wrongEntries(v).length}</small></button>`).join('')}</div><div class="row"><select class="select" id="wrong-chapter" aria-label="筛选错词章节"><option value="all">全部章节</option>${sections.map(s => `<option value="${s.id}" ${wrongChapter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select><label class="search">${icon('search', 14)}<input id="wrong-search" value="${esc(wrongSearch)}" placeholder="搜索单词…" aria-label="搜索错词"></label></div></div><div id="wrong-list">${wrongTable()}</div><div id="word-profiles">${profileTable()}</div>`;
+      `<div class="wrong-banner panel">${icon('edit', 30)}<div class="grow"><h2>${wrongBannerTitle()}</h2><p>${frequent ? '单词与词组中的同一错词合并累计；可查看来源并复习对应原词条。' : '听写后保留复习证据。类型筛选选择包含此类事件的词条；计数保留当前章节全部历史，输入、来源与播放按匹配类型。'}</p></div>${button(icon('play', 14) + (frequent ? ' 按高频复习' : ' 开始复习'), 'review-all', reviewCount ? '' : 'disabled', 'primary')}</div><div class="toolbar wrong-toolbar"><div class="segmented" aria-label="错词状态">${[['pending','待复习'],['uncertain','待确认'],['mastered','已掌握'],['frequency','高频错词']].map(([v, label]) => `<button class="${wrongFilter === v ? 'active' : ''}" data-act="wrong-filter" data-value="${v}">${label} <small data-wrong-count="${v}">${v==='frequency'?filteredFrequency().length:wrongEntries(v).length}</small></button>`).join('')}</div><div class="row"><select class="select" id="wrong-chapter" aria-label="筛选错词章节"><option value="all">全部章节</option>${sections.map(s => `<option value="${s.id}" ${wrongChapter === s.id ? 'selected' : ''}>${s.title}</option>`).join('')}</select><select class="select" id="wrong-reason" aria-label="筛选复习类型">${[['all','全部复习类型'],...Object.entries(reasonLabels)].map(([value,label])=>`<option value="${value}" ${wrongReason===value?'selected':''}>${label}</option>`).join('')}</select><label class="search">${icon('search', 14)}<input id="wrong-search" value="${esc(wrongSearch)}" placeholder="搜索单词…" aria-label="搜索错词"></label></div></div><div id="wrong-list">${wrongTable()}</div><div id="word-profiles">${profileTable()}</div>`;
   }
   function paperSetup() {
     const saved=read('paper',null);
-    modal('听音默写','在纸上作答，自评不计成绩。本轮按最近有效练习判断；历史正误混合与长期状态独立。连字符专项取当前章节（全部章节则取全语料），不受错词状态或搜索词影响。','<div class="settings-panel">'+[['source',[['all','全部错词'],['latest','最近一轮错词'],['repeat','重复错误词'],['filtered','当前筛选'],['hyphen','连字符专项'],['same-typo','重复相同错拼'],['round-unstable','本轮拼写不稳定'],['history-mixed','历史正误混合'],['long-fixed','长期固化错误'],['long-unstable','长期掌握不稳定']]],['shuffle',[[false,'顺序'],[true,'随机']]],['dedupe',[[true,'去重'],[false,'保留重复']]]].map(([key,choices])=>'<div class="option-group">'+choices.map(([v,label])=>button(label,'paper-option','data-key="'+key+'" data-value="'+v+'"',paperOptions[key]===v?'primary':'secondary')).join('')+'</div>').join('')+'</div><div class="modal-footer">'+button('开始听音默写','paper-start','','primary')+(saved?.items?.length?button('继续上次进度','paper-resume'):'')+'</div>');
+    modal('听音默写','在纸上作答，自评不计成绩。当前筛选遵循章节、状态、类型与搜索；其他历史来源跨所有章节并按所选复习类型选题。连字符专项仅按当前章节取词，不受错词状态或搜索词影响，也不受复习类型影响。本轮按最近有效练习判断；历史正误混合与长期状态独立。','<div class="settings-panel">'+[['source',[['all','全部待复习（所有章节）'],['latest','最近一轮错词'],['repeat','重复错误词'],['filtered','当前筛选'],['hyphen','连字符专项'],['same-typo','重复相同错拼'],['round-unstable','本轮拼写不稳定'],['history-mixed','历史正误混合'],['long-fixed','长期固化错误'],['long-unstable','长期掌握不稳定']]],['shuffle',[[false,'顺序'],[true,'随机']]],['dedupe',[[true,'去重'],[false,'保留重复']]]].map(([key,choices])=>'<div class="option-group">'+choices.map(([v,label])=>button(label,'paper-option','data-key="'+key+'" data-value="'+v+'"',paperOptions[key]===v?'primary':'secondary')).join('')+'</div>').join('')+'</div><div class="modal-footer">'+button('开始听音默写','paper-start','','primary')+(saved?.items?.length?button('继续上次进度','paper-resume'):'')+'</div>');
   }
   function paperItems() {
     if(paperOptions.source==='hyphen')return sections.filter(s=>wrongChapter==='all'||s.id===wrongChapter).flatMap(s=>C.itemsFor(D,s.id)).filter(item=>C.normalize(item.w).includes('-'));
-    if(paperOptions.source==='latest') {const last=records.filter(r=>['normal','dictation','shuffle','wrong'].includes(r.mode)).slice().sort((a,b)=>b.ts-a.ts)[0];return last?C.retryItems(D,C.recordView(last,RULES)):[];}
-    if(paperOptions.source==='filtered') return wrongFilter==='frequency'?W.practiceItems(D,filteredFrequency(),{dedupe:paperOptions.dedupe}):wrongFilter==='uncertain'?[]:paperReviewItems(filteredWrong());
-    if(paperOptions.source==='repeat') return W.practiceItems(D,frequencyStats().filter(e=>e.n>=2),{dedupe:paperOptions.dedupe});
-    if(['same-typo','round-unstable','history-mixed','spelling-unstable','long-fixed','long-unstable'].includes(paperOptions.source))return W.practiceItems(D,W.reviewProfiles(allProfiles(),paperOptions.source),{dedupe:paperOptions.dedupe});
-    return paperReviewItems(Object.entries(currentWrong()).filter(([,v])=>!v.mastered&&!v.pending));
+    if(paperOptions.source==='latest') {const last=records.filter(r=>['normal','dictation','shuffle','wrong'].includes(r.mode)).slice().sort((a,b)=>b.ts-a.ts)[0];if(!last)return [];const view=C.recordView(last,RULES);return C.retryItems(D,view).filter(item=>matchesReason(view.rows[item.rowIndex]));}
+    if(paperOptions.source==='filtered') return wrongFilter==='frequency'?frequencyItems(filteredFrequency(),{dedupe:paperOptions.dedupe}):wrongFilter==='uncertain'?[]:paperReviewItems(filteredWrong());
+    if(paperOptions.source==='repeat') return frequencyItems(frequencyStats().filter(e=>e.reviewCount>=2&&matchesReason(e)),{dedupe:paperOptions.dedupe});
+    if(['same-typo','round-unstable','history-mixed','spelling-unstable','long-fixed','long-unstable'].includes(paperOptions.source))return frequencyItems(W.reviewProfiles(allProfiles(),paperOptions.source),{dedupe:paperOptions.dedupe});
+    return paperReviewItems(Object.entries(currentWrong()).filter(([,value])=>!value.mastered&&!value.pending));
   }
   function paperReviewItems(entries){
-    entries=entries.filter(([,v])=>!v.pending);if(paperOptions.dedupe)return F.retryItems(D,entries);
+    entries=scopedReviewEntries(entries.filter(([,v])=>!v.pending));if(paperOptions.dedupe)return F.retryItems(D,entries);
     const items=[],seen=new Set();for(const [word,entry]of entries)for(const source of entry.sources||[]){
-      if(!source.n&&!source.manual)continue;
+      if(!source.reviewRows&&!source.n&&!source.manual)continue;
       const eligible=(source.occurrences||[]).filter(value=>value.type!=='legacy'||value.counted);
       const occurrences=eligible.length?eligible:source.manual?[{occurrenceId:'source:'+C.stableJSON([source.sid,source.index,word]),...source}]:[];
       for(const occurrence of occurrences){if(occurrence.type==='legacy'&&!occurrence.counted)continue;const id=occurrence.occurrenceId;if(seen.has(id))continue;const item=C.itemForRow(D,{w:word,sid:source.sid,index:source.index},source.sid);if(item){seen.add(id);items.push({...item,recordId:occurrence.recordId,rowIndex:occurrence.rowIndex,occurrenceId:id});}}
@@ -3425,7 +3541,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function startPaper(resume=false) {
     let state=resume?read('paper',null):null;
-    if(state) {const items=state.items?.map(item=>C.itemForRow(D,item,item.sid)).filter(Boolean);if(!items?.length)return toast('上次词条不在当前词库中。');state={...state,items,idx:Math.min(Math.max(0,Number(state.idx)||0),items.length-1),rate:[1,1.25,1.4,1.6].includes(state.rate)?state.rate:1,interval:[0,.5,1].includes(state.interval)?state.interval:0,loop:!!state.loop};}
+    if(state){state=F.restoredPaper(C,D,state);if(!state)return toast('上次词条不在当前词库中。');}
     else {const items=F.paperQueue(paperItems(),paperOptions);if(!items.length)return toast('这个来源没有可复习词条。');state={items,idx:0,rate:1,interval:0,loop:false,self:{}};}
     closeModal();paper.load(state);paperStartPending=true;navigate('paper');
   }
@@ -3446,10 +3562,10 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if(act==='paper-self')paper.state.self={...paper.state.self,[paper.state.idx]:value};
     save('paper',paper.state);$('#paper-stage').innerHTML=paperStage(paper.state);
   }
-  function wrongBannerTitle(){const count=wrongFilter==='frequency'?filteredFrequency().length:filteredWrong().length;return wrongFilter==='uncertain'?`${count} 条旧记录待确认。`:wrongFilter==='mastered'?`${count} 个词条保留已掌握标记。`:wrongFilter==='frequency'?`找到 ${count} 个高频错词，按错误次数逐个巩固。`:count?`还有 ${count} 个单词，值得再练一次。`:'今天，从熟悉一个新单词开始。';}
-  function wrongEntries(group=wrongFilter){return Object.entries(currentWrong()).map(([word,value])=>[word,C.projectWrong(value,wrongChapter)]).filter(([,value])=>value).filter(([word,w])=>(group==='uncertain'?w.hasPending||w.pending:group==='mastered'?w.mastered&&!w.pending:!w.mastered&&!w.pending)&&C.fold(word).includes(C.fold(wrongSearch))).sort((a,b)=>b[1].n-a[1].n);}
+  function wrongBannerTitle(){const count=wrongFilter==='frequency'?filteredFrequency().length:filteredWrong().length;return wrongFilter==='uncertain'?`${count} 条旧记录待确认。`:wrongFilter==='mastered'?`${count} 个词条保留已掌握标记。`:wrongFilter==='frequency'?`找到 ${count} 个高频错词，按复习事件逐个巩固。`:count?`还有 ${count} 个单词，值得再练一次。`:'今天，从熟悉一个新单词开始。';}
+  function wrongEntries(group=wrongFilter){return Object.entries(currentWrong()).map(([word,value])=>[word,C.projectWrong(value,wrongChapter)]).filter(([,value])=>value).filter(([word,w])=>(group==='uncertain'?w.hasPending||w.pending:group==='mastered'?w.mastered&&!w.pending:!w.mastered&&!w.pending)&&C.fold(word).includes(C.fold(wrongSearch))).filter(([,value])=>matchesReason(value)).sort((a,b)=>b[1].reviewCount-a[1].reviewCount||b[1].n-a[1].n);}
   function filteredWrong(){return wrongEntries();}
-  function filteredReviewItems(){return wrongFilter==='uncertain'?[]:reviewItems(filteredWrong().filter(([,w])=>!w.mastered&&!w.pending));}
+  function filteredReviewItems(){return wrongFilter==='uncertain'||wrongFilter==='mastered'?[]:reviewItems(filteredWrong().filter(([,w])=>!w.mastered&&!w.pending));}
   function showWrongEvidence(word){
     const entry=currentWrong()[word]&&C.projectWrong(currentWrong()[word],wrongChapter),saved=wrong[word];if(!entry)return;
     const rows=records.flatMap(record=>(record.rows||[]).flatMap((row,index)=>row?.w===word&&(wrongChapter==='all'||(row.sid||record.sid)===wrongChapter)?[{record,row,index}]:[]));
@@ -3461,75 +3577,83 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const sourceLabel=value=>esc(value.sid)+' / '+(Number.isInteger(value.index)?value.index+1:'—');
     const rawInput=value=>esc(typeof value.input==='string'?value.input||'未作答':typeof value.in==='string'?value.in||'未作答':'缺少原始输入');
     const evidenceTable=(values,label,describe)=>values.length?'<table><thead><tr><th>原章节 / 序号</th><th>原始输入</th><th>'+label+'</th></tr></thead><tbody>'+values.map(value=>'<tr><td>'+sourceLabel(value)+'</td><td>'+rawInput(value)+'</td><td>'+describe(value)+'</td></tr>').join('')+'</tbody></table>':'<p class="muted">当前范围没有这类证据。</p>';
-    const confirmedTable=evidenceTable(confirmed,'计数依据',value=>value.type==='history'?'答卷第 '+(value.rowIndex+1)+' 题 · 1 次 '+button('查看原答卷','record','data-id="'+esc(value.recordId)+'"','text-btn'):C.legacyRowId(value)?'独立旧原始行 · 1 次':'旧输入下限证据 · 1 次');
+    const confirmedTable=evidenceTable(confirmed,'学习判分与复习原因',value=>{
+      const origin=value.type==='history'?'答卷第 '+(value.rowIndex+1)+' 题 '+button('查看原答卷','record','data-id="'+esc(value.recordId)+'"','text-btn'):C.legacyRowId(value)?'独立旧原始行':'旧输入下限证据';
+      const tokens=(value.reviewEvents||[]).map(event=>'<div class="review-token" data-event-id="'+esc(event.id)+'"><strong>'+esc(event.expected)+'</strong> ← '+esc(event.input||'未作答')+' · 第 '+(event.tokenIndex+1)+' 词<br>'+reasonBadges(event)+'<br>'+(event.reviewReasons.includes('homophone')?'学习判分：正确（语料库同音豁免）<br>复习原因：同音异形词混淆':'学习判分：错误 · 复习原因：'+esc(reasonText(event)))+'</div>').join('');
+      return origin+'<p>整题学习判分：'+(value.learningCorrect?'正确':'错误')+'</p>'+tokens+(value.reviewPending?'<p>整题待复习，词级归属待确认</p>':'');
+    });
     const unresolvedTable=evidenceTable(unresolved,'待核实原因',value=>({ 'missing-input':'缺少原始输入','unresolved-link':'无法确定与已有记录是否重复','conflicting-source':'同一旧原始行存在不同输入' }[value.state]));
     const cumulativeTable=evidenceTable(cumulative,'保存的累计声明',value=>esc(value.n)+' 次（未验证）');
     const manual=entry.sources.filter(source=>source.manual);
     const archive=evidenceTable(snapshots,'原始声明',value=>C.legacyRowId(value)?'旧原始行':esc(value.n??'—'));
     const rawRecords=rows.length?'<table><thead><tr><th>原记录 / 题号</th><th>原始输入</th><th>答卷</th></tr></thead><tbody>'+rows.map(({record,row,index})=>'<tr><td>'+esc(record.id)+' / '+(index+1)+'</td><td>'+rawInput(row)+'</td><td>'+button('查看原答卷','record','data-id="'+esc(record.id)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table>':'<p>当前范围未找到完整原答卷。</p>';
     const body='<p>掌握标记：'+(entry.mastered?'已掌握（保留）':'未掌握')+'</p>'+
-      '<section data-evidence-group="confirmed"><h3>确定错误 · '+entry.n+' 次</h3><p>以下每条证据计一次错误，可作为复习来源；是否进入复习队列仍遵循掌握标记。</p>'+confirmedTable+(manual.length?'<p>另有手动标记来源：'+manual.map(sourceLabel).join('、')+'。手动标记可用于复习，不增加错误次数。</p>':'')+'</section>'+
+      '<section data-evidence-group="confirmed"><h3>原题计错 · '+entry.n+' 次</h3><p>原题复习 '+entry.reviewRows+' 次 · '+reviewSummary(entry)+'。同音混淆学习计对，独立保留复习证据；掌握标记不改变历史次数。</p>'+confirmedTable+(manual.length?'<p>另有手动标记来源：'+manual.map(sourceLabel).join('、')+'。手动标记可用于复习，不增加错误次数。</p>':'')+'</section>'+
       '<section data-evidence-group="unresolved"><h3>待核实来源 · '+unresolved.length+' 条</h3><p>以下证据不增加确定错误次数，也不作为复习或 TXT 来源；标记掌握不会改变证据状态。</p>'+unresolvedTable+'</section>'+
-      '<section data-evidence-group="cumulative"><h3>未验证旧累计</h3><p>累计声明不等于已核实的错误次数。有有效错误输入时，每个原题来源最多保留一次旧输入下限证据，已列在“确定错误”；不能按累计数字生成多次练习。</p>'+cumulativeTable+'</section>'+
+      '<section data-evidence-group="cumulative"><h3>未验证旧累计</h3><p>累计声明不等于已核实的错误次数。有有效错误输入时，每个原题来源最多保留一次旧输入下限证据，已列在“确定复习证据”；不能按累计数字生成多次练习。</p>'+cumulativeTable+'</section>'+
       '<details><summary>查看原始记录与旧快照</summary>'+rawRecords+'<h3>不可变旧证据</h3>'+archive+'</details>';
-    const description=entry.hasPending&&!entry.pending?'确定错误或手动来源可用于复习；另有待核实证据，分别列明如下。':entry.pending?'当前来源待确认，不加入普通复习或 TXT。':'当前来源的计数依据与旧累计分别列明如下。';
-    modal('原始证据 · '+esc(word),description,body,true);
+    const description=entry.hasPending&&!entry.pending?'确定复习或手动来源可用于复习；另有待核实证据，分别列明如下。':entry.pending?'当前来源待确认，不加入普通复习或 TXT。':'当前来源的计数依据与旧累计分别列明如下。';
+    modal('原始证据 · '+esc(word),description+' 详情与计数保留所选章节全部类型历史；类型筛选只限制列表输入、来源与练习。',body,true);
   }
   function wrongTable() {
     if (wrongFilter === 'frequency') return frequencyTable();
     const list = filteredWrong();
     if (!list.length) return `<div class="panel">${empty('这里还没有错词', pending().length ? '换一个章节或搜索词看看。' : '完成一次听写后，错词会出现在这里。也可以导入项目已有的错词记录。', button('去练习', 'route', 'data-route="library"', 'primary') + ' ' + button('导入已有错词', 'legacy'))}</div>`;
-    return `<div class="panel table-wrap"><table><thead><tr><th>单词 / 释义</th><th>最近输入</th><th>错误次数</th><th>来自章节</th><th>操作</th></tr></thead><tbody>${list.map(([word, w]) => {
-      const item = F.retryItems(D, [[word, w]])[0];
-      return `<tr><td><strong class="english">${esc(word)}</strong><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="red">${esc(typeof w.in==='string'?w.in||'未作答':'原始输入缺失')}</td><td>${(w.pending?'待确认':w.manual&&!w.n?'手动标记':w.n+' 次'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':''))+(w.hasPending&&!w.pending?' · 另有待确认旧证据':'')}</td><td>${esc([...new Set(w.sources.map(source=>source.sid))].join("、"))}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${item?.sid || w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}">${w.pending?(w.mastered?'取消掌握标记（仍待确认）':'标记掌握（仍待确认）'):w.mastered?'移回待复习':'标记掌握'}</button><button class="text-btn" data-act="wrong-evidence" data-word="${esc(word)}">查看证据</button></div></td></tr>`;
+    return `<div class="panel table-wrap"><table><thead><tr><th>单词 / 释义</th><th>最近匹配复习输入</th><th>复习与原题计数</th><th>匹配复习来源章节</th><th>操作</th></tr></thead><tbody>${list.map(([word, w]) => {
+      const item = reviewItems([[word, w]])[0],{latest,input,sids}=entryPresentation(w);
+      return `<tr><td><strong class="english">${esc(word)}</strong><div>${reasonBadges(w)}</div><div class="muted" style="font-size:11px">${esc(item?.m || '')}</div></td><td class="${latest?.learningCorrect?'purple':'red'}">${esc(typeof input==='string'?input||'未作答':'原始输入缺失')}</td><td>${(w.pending?'待确认':w.manual&&!w.reviewRows?'手动标记':w.reviewRows+' 次原题复习'+(w.legacyCount>1?'（旧累计 '+w.legacyCount+' 待确认）':''))+(!w.pending?'<small class="frequency-breakdown">原题计错 '+w.n+' 次 · '+reviewSummary(w)+'</small>':'')+(w.reviewPending?'<small>整题待复习，词级归属待确认</small>':'')+(w.hasPending&&!w.pending?' · 另有待确认旧证据':'')}</td><td>${esc(sids.join("、"))}</td><td><div class="table-actions"><button class="icon-btn" aria-label="播放 ${esc(word)}" data-act="speak" data-sid="${item?.sid || w.sid}" data-index="${item?.index ?? -1}">${icon('volume', 16)}</button><button class="text-btn" data-act="master" data-word="${esc(word)}" data-value="${!w.mastered}">${w.pending?(w.mastered?'取消掌握标记（仍待确认）':'标记掌握（仍待确认）'):w.mastered?'移回待复习':'标记掌握'}</button><button class="text-btn" data-act="wrong-evidence" data-word="${esc(word)}">查看证据</button></div></td></tr>`;
     }).join('')}</tbody></table></div>`;
   }
   function frequencyStats() {
     if (!frequencyCache || frequencyCache.records !== records || frequencyCache.length !== records.length || frequencyCache.signature!==C.ruleSignature(RULES)) {
       frequencyCache = {records, length:records.length, signature:C.ruleSignature(RULES), profiles:W.profiles(records,RULES)};
     }
-    return frequencyCache.profiles.filter(entry=>entry.n>0);
+    return frequencyCache.profiles.filter(entry=>entry.reviewCount>0);
   }
-  function filteredFrequency() { return W.filter(frequencyStats(), wrongChapter, wrongSearch); }
+  function filteredFrequency() { return W.filter(frequencyStats(), wrongChapter, wrongSearch).filter(entry=>entry.reviewCount>0&&matchesReason(entry)); }
   function refreshWrongList() {
     $('#wrong-list').innerHTML=wrongTable();
     document.querySelectorAll('[data-wrong-count]').forEach(node=>{node.textContent=node.dataset.wrongCount==='frequency'?filteredFrequency().length:wrongEntries(node.dataset.wrongCount).length;});
     const heading=$('.wrong-banner h2'),review=$('.wrong-banner [data-act="review-all"]');
     if(heading)heading.textContent=wrongBannerTitle();
-    if(review)review.disabled=wrongFilter==='frequency'?!W.practiceItems(D,filteredFrequency()).length:!filteredReviewItems().length;
+    if(review)review.disabled=wrongFilter==='frequency'?!frequencyItems(filteredFrequency()).length:!filteredReviewItems().length;
     if($('#word-profiles')) $('#word-profiles').innerHTML=profileTable();
     decorateAudioControls();
   }
   function allProfiles(){frequencyStats();return frequencyCache.profiles;}
   function profileTable(resultOnly=false){
     let list=W.filter(allProfiles(),resultOnly?'all':wrongChapter,resultOnly?'':wrongSearch);
+    if(!resultOnly)list=list.filter(value=>matchesReason(value));
     if(resultOnly){const relevant=new Set(result.rows.flatMap(row=>W.tokens(C.answerForms(row.w)[0]).map(word=>C.canonicalSpelling(word,RULES,true))));list=list.filter(e=>relevant.has(e.word));}
     const pending=list.reduce((n,e)=>n+e.pending,0),valid=list.reduce((n,e)=>n+e.total,0),unattributed=(allProfiles().unattributedPending||[]).filter(v=>resultOnly?v.recordId===result.id:wrongChapter==='all'||v.sid===wrongChapter).length;
-    return '<div class="section-top"><h2>全历史单词档案</h2><span class="muted">'+list.length+' 词 · 有效出现 '+valid+' · 待确认 '+pending+(unattributed?' · 行级未归属待确认 '+unattributed:'')+'</span></div><p class="notice">标准单词合并独立词与词组的全部出现；同一轮重复逐次计入。待确认不进入正确率。长期状态需跨日期证据；少量样本仅提供独立短期观察。同日反复答对仍可能数据不足。历史原答卷与判分保留。</p><div class="panel table-wrap"><table><thead><tr><th>标准词</th><th>正确次数 / 有效出现</th><th>主要错拼</th><th>长期状态 / 本轮与历史观察</th><th>详情</th></tr></thead><tbody>'+list.slice(0,profileLimit).map(e=>'<tr><td><strong class="english">'+esc(e.expected)+'</strong></td><td>'+e.correct+' / '+e.total+' · '+(e.accuracy===null?'—':e.accuracy+'%')+'</td><td>'+esc(e.typos[0]?.input||(e.n?'漏写':'—'))+(e.typos[0]?' × '+e.typos[0].n:'')+'</td><td>'+e.status+'<small class="frequency-breakdown">'+esc(e.observations.slice(0,2).map(v=>v.label).join('；')||'暂无短期观察')+'</small><small class="frequency-breakdown">覆盖 '+e.coverage+'% · 待确认 '+e.pending+'</small></td><td>'+button('查看来源','word-profile','data-word="'+esc(e.word)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>'+(list.length>profileLimit?button('显示更多档案','profiles-more'):'');
+    return '<div class="section-top"><h2>全历史单词档案</h2><span class="muted">'+list.length+' 词 · 有效出现 '+valid+' · 待确认 '+pending+(unattributed?' · 行级未归属待确认 '+unattributed:'')+'</span></div><p class="notice">标准单词合并独立词与词组的全部出现；同一轮重复逐次计入。待确认不进入正确率。长期状态需跨日期证据；少量样本仅提供独立短期观察。同日反复答对仍可能数据不足。历史原答卷与判分保留。</p><div class="panel table-wrap"><table><thead><tr><th>标准词</th><th>正确次数 / 有效出现</th><th>主要错拼</th><th>长期状态 / 本轮与历史观察</th><th>详情</th></tr></thead><tbody>'+list.slice(0,profileLimit).map(e=>'<tr><td><strong class="english">'+esc(e.expected)+'</strong><div>'+reasonBadges(e)+'</div></td><td>'+e.correct+' / '+e.total+' · '+(e.accuracy===null?'—':e.accuracy+'%')+'</td><td>'+esc(e.typos[0]?.input||(e.n?'漏写':'—'))+(e.typos[0]?' × '+e.typos[0].n:'')+'</td><td>'+e.status+'<small class="frequency-breakdown">'+esc(e.observations.slice(0,2).map(v=>v.label).join('；')||'暂无短期观察')+'</small><small class="frequency-breakdown">覆盖 '+e.coverage+'% · 待确认 '+e.pending+'</small></td><td>'+button('查看来源','word-profile','data-word="'+esc(e.word)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>'+(list.length>profileLimit?button('显示更多档案','profiles-more'):'');
   }
   function showWordProfile(word){
-    const e=allProfiles().find(e=>e.word===word);if(!e)return;
+    const e=W.filter(allProfiles(),route==='wrong'?wrongChapter:'all').find(e=>e.word===word);if(!e)return;
     const last=v=>v?new Date(v.ts).toLocaleDateString('zh-CN')+' · '+v.context:'—';
     modal('单词档案 · '+esc(e.expected),'按 '+C.ANALYSIS_VERSION+' 分析 · 原答卷保留',
-      '<p>有效出现 '+e.total+' · 正确 '+e.correct+' · 错误 '+e.n+' · 正确率 '+(e.accuracy===null?'—':e.accuracy+'%')+' · 待确认 '+e.pending+' · 覆盖 '+e.coverage+'%</p><p>单独单词 '+e.standaloneStats.correct+' / '+e.standaloneStats.total+' · 词组内部 '+e.phraseStats.correct+' / '+e.phraseStats.total+' · 长期状态：'+e.status+'</p><p>短期观察（不代表长期结论）：'+esc(e.observations.map(v=>v.label).join('；')||'暂无')+'</p><p>最近正确：'+esc(last(e.lastCorrect))+'<br>最近错误：'+esc(last(e.lastIncorrect))+'</p><p>错误写法：'+(e.typos.map(v=>esc(v.input||'漏写')+' × '+v.n).join('；')||'—')+'</p><p class="notice">基本掌握需至少8次有效记录、3个日期、跨度7天且最近6次跨2日期全对；固化/不稳定需至少6次有效记录与3个日期。固化还需同错拼至少3次跨2日、最近仍错。</p><div class="table-wrap"><table><thead><tr><th>日期 / 原题</th><th>原始输入</th><th>词级输入 / 判定</th><th>来源</th></tr></thead><tbody>'+e.occurrences.map(v=>'<tr><td>'+esc(v.day)+'<br>'+esc(v.context)+'</td><td>'+esc(v.rawInput===null?'缺少原始输入':v.rawInput||'未作答')+'</td><td>'+esc(v.input||'—')+'<br>'+({correct:'正确',incorrect:'错误',omission:'漏写',pending:'待确认'}[v.verdict])+' · '+esc(v.reason)+'</td><td>'+esc(v.sid)+' #'+(Number.isInteger(v.index)?v.index+1:'—')+'<br>'+button('原答卷','record','data-id="'+esc(v.recordId)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>',true);
+      '<p>'+reasonBadges(e)+' '+reviewSummary(e)+'</p><p>有效出现 '+e.total+' · 正确 '+e.correct+' · 词级计错 '+e.n+' · 正确率 '+(e.accuracy===null?'—':e.accuracy+'%')+' · 待确认 '+e.pending+' · 覆盖 '+e.coverage+'%</p><p>单独单词 '+e.standaloneStats.correct+' / '+e.standaloneStats.total+' · 词组内部 '+e.phraseStats.correct+' / '+e.phraseStats.total+' · 长期状态：'+e.status+'</p><p>短期观察（不代表长期结论）：'+esc(e.observations.map(v=>v.label).join('；')||'暂无')+'</p><p>最近正确：'+esc(last(e.lastCorrect))+'<br>最近错误：'+esc(last(e.lastIncorrect))+'<br>最近复习输入：'+esc(e.lastReview?.input||'—')+'</p><p>错误写法：'+(e.typos.map(v=>esc(v.input||'漏写')+' × '+v.n).join('；')||'—')+'</p><p class="notice">基本掌握需至少8次有效记录、3个日期、跨度7天且最近6次跨2日期全对；固化/不稳定需至少6次有效记录与3个日期。固化还需同错拼至少3次跨2日、最近仍错。</p><div class="table-wrap"><table><thead><tr><th>日期 / 原题</th><th>原始输入</th><th>词级输入 / 判定</th><th>来源</th></tr></thead><tbody>'+e.occurrences.map(v=>'<tr><td>'+esc(v.day)+'<br>'+esc(v.context)+'</td><td>'+esc(v.rawInput===null?'缺少原始输入':v.rawInput||'未作答')+'</td><td>'+esc(v.input||'—')+'<br>'+({correct:'正确',incorrect:'错误',omission:'漏写',pending:'待确认'}[v.verdict])+' · '+esc(v.reason)+'<br>'+reasonBadges(v)+(v.reviewReasons.includes('homophone')?'学习判分：正确（语料库同音豁免） · 复习原因：同音异形词混淆':'')+'</td><td>'+esc(v.sid)+' #'+(Number.isInteger(v.index)?v.index+1:'—')+'<br>'+button('原答卷','record','data-id="'+esc(v.recordId)+'"','text-btn')+'</td></tr>').join('')+'</tbody></table></div>',true);
   }
+  function matchingFrequencyOccurrences(entry,source){return entry.occurrences.filter(value=>value.reviewRequired&&matchesReason(value)&&(!source||value.sid===source.sid&&value.index===source.index&&value.context===source.w));}
   function frequencyTable() {
-    const list = filteredFrequency(), total = list.reduce((sum,entry) => sum+entry.n,0);
-    const note = `<div class="frequency-summary panel"><strong>累计 ${num(total)} 次拼写错误 · ${list.length} 个词</strong><p>按错误次数从高到低排列。单词和词组中的同一错词合并；仅可靠对齐的错误与漏写计入错误次数；歧义在下方档案显示为待确认。答对或标记掌握不会减少历史次数。</p><small>依据已完成听写的即时拼写判定，单复数和同音错误也保留统计。草稿、旧版仅错词记录和纯格式差异不计入。</small></div>`;
-    if (!list.length) return note+`<div class="panel">${empty('暂无高频错词', frequencyStats().length ? '试试其他章节或搜索词。' : '完成听写后，这里会自动统计每个词的错误次数。', button('去练习','route','data-route="library"','primary'))}</div>`;
-    return note+`<div class="panel table-wrap"><table class="frequency-table"><thead><tr><th>排名 / 单词</th><th>累计错误次数</th><th>最近错误输入</th><th>错误来源</th><th>操作</th></tr></thead><tbody>${list.map((entry,i)=>`<tr data-frequency-word="${esc(entry.word)}"><td><span class="frequency-rank">${i+1}</span><strong class="english">${esc(entry.word)}</strong></td><td><strong class="frequency-count">${entry.n} 次</strong><small class="frequency-breakdown">单词 ${entry.standalone} · 词组 ${entry.phrases}</small></td><td class="red">${esc(entry.lastInput || '漏写 / 未作答')}</td><td class="frequency-sources">${entry.sources.slice(0,3).map(source=>`<span>${esc(source.w)} <small>× ${source.n}</small></span>`).join('')}${entry.sources.length>3?`<small>另有 ${entry.sources.length-3} 个来源</small>`:''}</td><td><button class="text-btn" data-act="frequency-sources" data-word="${esc(entry.word)}">查看来源</button></td></tr>`).join('')}</tbody></table></div>`;
+    const list=filteredFrequency(),total=list.reduce((sum,entry)=>sum+entry.reviewCount,0);
+    const note='<div class="frequency-summary panel"><strong>累计 '+num(total)+' 次词级复习 · '+list.length+' 个词</strong><p>按复习事件从高到低排列。同音混淆学习计对；拼写错误与漏写计入词级错误。类型筛选选择包含该类型的词，计数保留所选章节完整历史；练习只使用匹配类型的来源。</p><small>草稿、旧版仅错词记录不进入词级高频；歧义保留待确认，掌握标记不减少历史次数。</small></div>';
+    if(!list.length)return note+'<div class="panel">'+empty('暂无高频复习词','试试其他章节、复习类型或搜索词。')+'</div>';
+    return note+'<div class="panel table-wrap"><table class="frequency-table"><thead><tr><th>排名 / 单词</th><th>词级复习与计错</th><th>最近复习输入</th><th>复习来源</th><th>操作</th></tr></thead><tbody>'+list.map((entry,i)=>{
+      const last=matchingFrequencyOccurrences(entry).at(-1),sources=entry.sources.filter(source=>matchingFrequencyOccurrences(entry,source).length);
+      return '<tr data-frequency-word="'+esc(entry.word)+'"><td><span class="frequency-rank">'+(i+1)+'</span><strong class="english">'+esc(entry.word)+'</strong><div>'+reasonBadges(entry)+'</div></td><td><strong class="frequency-count">'+entry.reviewCount+' 次</strong><small class="frequency-breakdown">词级计错 '+entry.n+' · '+reviewSummary(entry)+' · 计错来源：单词 '+entry.standalone+' · 词组 '+entry.phrases+'</small></td><td>'+esc(last?.input||'漏写 / 未作答')+'</td><td class="frequency-sources">'+sources.slice(0,3).map(source=>'<span>'+esc(source.w)+' <small>× '+source.reviewCount+'</small></span>').join('')+'</td><td>'+button('查看来源','frequency-sources','data-word="'+esc(entry.word)+'"','text-btn')+'</td></tr>';
+    }).join('')+'</tbody></table></div>';
   }
   function showFrequencySources(word) {
-    const entry = filteredFrequency().find(value => value.word === word);
-    if (!entry) return;
-    modal('错词来源 · '+esc(entry.word), `累计 ${entry.n} 次 · 单词 ${entry.standalone} 次 · 词组 ${entry.phrases} 次`,
-      `<div class="table-wrap"><table class="frequency-origin-table"><thead><tr><th>原词条</th><th>错误次数</th><th>最近答卷输入</th><th>章节</th><th>原音</th></tr></thead><tbody>${entry.sources.map(source=>{
-        const item=C.itemForRow(D,source,source.sid);
-        return `<tr><td><strong>${esc(source.w)}</strong><small class="frequency-breakdown">${source.phrase?'词组':'单词'}</small></td><td>${source.n} 次</td><td class="red">${esc(source.in||'未作答')}</td><td>${esc(source.sid)}</td><td>${item?`<button class="icon-btn" data-act="speak" data-sid="${esc(item.sid)}" data-index="${item.index}" aria-label="播放 ${esc(source.w)}">${icon('volume',16)}</button>`:'—'}</td></tr>`;
-      }).join('')}</tbody></table></div><div class="modal-footer">${button('复习这些词条','review-frequency',`data-word="${esc(word)}"`,'primary')}</div>`,true);
+    const entry=filteredFrequency().find(value=>value.word===word);if(!entry)return;
+    modal('复习来源 · '+esc(entry.word),reviewSummary(entry)+' · 词级计错 '+entry.n,
+      '<div class="table-wrap"><table class="frequency-origin-table"><thead><tr><th>原词条</th><th>词级复习</th><th>最近匹配复习输入</th><th>章节</th><th>原音</th></tr></thead><tbody>'+entry.sources.filter(source=>matchingFrequencyOccurrences(entry,source).length).map(source=>{
+        const item=C.itemForRow(D,source,source.sid),last=matchingFrequencyOccurrences(entry,source).at(-1);
+        return '<tr><td><strong>'+esc(source.w)+'</strong></td><td>'+source.reviewCount+' 次 '+reasonBadges(source)+'</td><td>'+esc(last.rawInput||'未作答')+'</td><td>'+esc(source.sid)+'</td><td>'+(item?button(icon('volume',16),'speak','data-sid="'+esc(item.sid)+'" data-index="'+item.index+'"','icon-btn'):'—')+'</td></tr>';
+      }).join('')+'</tbody></table></div><div class="modal-footer">'+button('复习这些词条','review-frequency','data-word="'+esc(word)+'"','primary')+'</div>',true);
   }
   function reviewFrequency(word) {
-    const list=filteredFrequency().filter(entry=>!word||entry.word===word),items=W.practiceItems(D,list);
+    const list=filteredFrequency().filter(entry=>!word||entry.word===word),items=frequencyItems(list);
     if (!items.length) return toast('这些历史词条目前不在词库中。');
     closeModal(); openSetup('review',items);
   }
@@ -3538,19 +3662,18 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       '<label class="checkbox"><input type="checkbox" id="txt-dedupe" checked>去除重复条目</label><div class="modal-footer">'+button('仅单词 TXT','export-answers','data-type="words"')+button('完整词组 TXT','export-answers','data-type="phrases"')+button('当前筛选结果','export-answers','data-type="filtered"')+'</div>');
   }
   function answerEntries(type){
-    const items=type==='filtered'?(wrongFilter==='frequency'?W.practiceItems(D,filteredFrequency()):wrongFilter==='uncertain'?[]:F.retryItems(D,filteredWrong().filter(([,w])=>!w.pending))):F.retryItems(D,Object.entries(currentWrong()).filter(([,v])=>!v.mastered&&!v.pending));
+    const items=type==='filtered'?(wrongFilter==='frequency'?frequencyItems(filteredFrequency()):wrongFilter==='uncertain'?[]:reviewItems(filteredWrong().filter(([,w])=>!w.pending))):reviewItems(wrongEntries('pending'));
     if(type==='filtered')return items;
     const list=items.filter(item=>F.kindFor(item,vocabularyTypes,vocabulary)===(type==='phrases'?'phrase':'word'));
-    if(type==='words')for(const entry of frequencyStats())if(entry.sources.some(source=>source.phrase&&source.n>0))list.push({w:entry.expected||entry.word});
+    if(type==='words')for(const entry of filteredFrequency())if(entry.occurrences.some(value=>value.sourceType==='phrase'&&value.reviewRequired&&matchesReason(value)))list.push({w:entry.expected||entry.word});
     return list;
   }
-  function exportAnswers(type){const text=F.answerText(answerEntries(type),$('#txt-dedupe')?.checked!==false);if(!text)return toast('当前没有符合条件的标准答案。');download('正确答案-'+type+'.txt',text+'\n','text/plain;charset=utf-8');closeModal();}
-  function exportFrequency() {
-    const list=filteredFrequency();
-    if (!list.length) return toast('当前没有高频错词可导出。');
-    csvDownload('高频错词统计',[['单词','累计拼写错误次数','单词中错误次数','词组中错误次数','最近错误输入','来源词条','章节'],
-      ...list.map(entry=>[entry.word,entry.n,entry.standalone,entry.phrases,entry.lastInput,entry.sources.map(source=>`${source.w} × ${source.n}`).join('；'),[...new Set(entry.sources.map(source=>source.sid))].join('；')])]);
+  async function exportAnswers(type){const dedupe=$('#txt-dedupe')?.checked!==false,entries=await evidenceView(()=>answerEntries(type));if(!entries)return;const text=F.answerText(entries,dedupe);if(!text)return toast('当前没有符合条件的标准答案。');download('正确答案-'+type+'.txt',text+'\n','text/plain;charset=utf-8');closeModal();}
+  async function exportFrequency() {
+    const list=await evidenceView(filteredFrequency);if(!list)return;if(!list.length)return toast('当前没有高频复习词可导出。');
+    csvDownload('高频错词统计',[['单词','词级计错次数','词级复习次数','同音混淆次数','拼写错误次数','漏写次数','复习类型','最近复习输入','来源词条','章节','计数口径'],...list.map(entry=>[entry.word,entry.n,entry.reviewCount,entry.homophoneCount,entry.spellingCount,entry.omissionCount,reasonText(entry),matchingFrequencyOccurrences(entry).at(-1)?.input,entry.sources.filter(source=>matchingFrequencyOccurrences(entry,source).length).map(source=>source.w+' × '+source.reviewCount).join('；'),[...new Set(matchingFrequencyOccurrences(entry).map(value=>value.sid))].join('；'),'所选章节全部类型历史'])]);
   }
+  async function exportWrong(){const entries=await evidenceView(()=>filteredWrong().map(([word,value])=>[word,value,entryPresentation(value)]));if(!entries)return;if(!entries.length){toast('当前筛选下没有错词可导出。');return;}csvDownload('错词本',[['单词','匹配复习来源章节','最近匹配复习输入','原题计错次数','掌握状态','旧累计次数（待确认）','另有待确认来源','复习类型','原题复习次数','词级复习次数','同音混淆次数','拼写错误次数','漏写次数','计数口径'],...entries.map(([w,v,presentation])=>{return [w,presentation.sids.join('、'),presentation.input,v.n,v.pending?'待确认':v.mastered?'已掌握':v.manual&&!v.reviewRows?'手动标记':'待复习',v.legacyCount??'',v.hasPending?'是':'否',reasonText(v),v.reviewRows,v.reviewCount,v.homophoneCount,v.spellingCount,v.omissionCount,'所选章节全部类型历史'];})]);}
   function statistics() {
     const rs = currentRecords().filter(r => r.mode !== 'legacy'), today = dayRecords();
     return heading('学习统计', '让努力被看见，让进步有迹可循。', button(icon('download', 15) + ' 导出学习记录', 'export-records')) +
@@ -3564,9 +3687,9 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   }
   function toggleRow(label, description, name, disabled = false) { return `<div class="setting-row toggle-row"><div><h3>${label}</h3><p>${description}</p></div><button class="switch" role="switch" aria-checked="${!!settings[name]}" aria-label="${label}" data-act="toggle-setting" data-key="${name}" ${disabled ? 'disabled aria-disabled="true"' : ''}></button></div>`; }
   function settingsForm() {
-    return `<div class="settings-panel panel">${optionRow('快捷预设', '一键调整倍速、间隔、重复次数', 'preset', Object.keys(presets).map(k => [k, k]))}${optionRow('练习倍速', '找到适合自己的听力节奏', 'rate', [0.8, 1, 1.2, 1.4, 1.6, 2].map(n => [n, '×' + n]))}${optionRow('基础间隔', `基础秒数 ÷ 练习倍速，当前实际 ${pauseLabel()} 秒；词组停顿也缩短`, 'interval', [1, 2, 3, 4, 5].map(n => [n, n + ' 秒']))}${optionRow('播放次数', '每个单词的重复播放次数', 'repeat', [[1, '1 次'], [2, '2 次'], [3, '3 次'], [5, '5 次'], [0, '无限']])}${optionRow('听写提交', `自动模式播放结束后等待 ${pauseLabel()} 秒；可提前提交，超时未答计错`, 'submit', [['manual', '手动提交'], ['auto', '自动提交']])}</div><h3 class="settings-section">答题偏好</h3><div class="settings-panel panel">${toggleRow('即时对错反馈', '列表显示文字对错，沉浸显示 ✅ / ❌', 'showFeedback')}${toggleRow('答错时显示正确拼写', '即时反馈开启时，答错、跳过或超时后显示正确答案；不会自动显示译文', 'showCorrectAnswer', !settings.showFeedback)}${toggleRow('显示原文', '练习中直接显示英文原文，默认关闭', 'showSrc')}${toggleRow('显示译文', '练习中显示中文释义，默认关闭', 'showMean')}${toggleRow('忽略大小写', '不区分单词的大小写', 'ignoreCase')}${toggleRow('答对自动下一题', '按统一学习判分，输入正确时自动进入下一个词', 'autoNext')}<p class="notice">全站统一使用学习判分：规范拼写、明确格式容差及训练豁免均计对；严格正确率仅供答卷辅助对照。</p></div><div class="hint-box">${icon('keyboard', 15)} Enter 提交 / 下一词　·　Ctrl + Enter 跳过　·　Tab 重听　·　Alt + ← / → 换词　·　Esc 停止播放</div>`;
+    return `<div class="settings-panel panel">${optionRow('快捷预设', '一键调整倍速、间隔、重复次数', 'preset', Object.keys(presets).map(k => [k, k]))}${optionRow('练习倍速', '找到适合自己的听力节奏', 'rate', [0.8, 1, 1.2, 1.4, 1.6, 2].map(n => [n, '×' + n]))}${optionRow('基础间隔', `基础秒数 ÷ 练习倍速，当前实际 ${pauseLabel()} 秒；词组停顿也缩短`, 'interval', [1, 2, 3, 4, 5].map(n => [n, n + ' 秒']))}${optionRow('播放次数', '每个单词的重复播放次数', 'repeat', [[1, '1 次'], [2, '2 次'], [3, '3 次'], [5, '5 次'], [0, '无限']])}${optionRow('听写提交', `自动模式播放结束后等待 ${pauseLabel()} 秒；可提前提交，超时未答计错`, 'submit', [['manual', '手动提交'], ['auto', '自动提交']])}</div><h3 class="settings-section">答题偏好</h3><div class="settings-panel panel">${toggleRow('即时对错反馈', '列表显示文字对错，沉浸显示 ✅ / ❌', 'showFeedback')}${toggleRow('答错时显示正确拼写', '即时反馈开启时，答错、跳过或超时后显示正确答案；不会自动显示译文', 'showCorrectAnswer', !settings.showFeedback)}${toggleRow('显示原文', '练习中直接显示英文原文，默认关闭', 'showSrc')}${toggleRow('显示译文', '练习中显示中文释义，默认关闭', 'showMean')}${toggleRow('答对自动下一题', '按统一学习判分，输入正确时自动进入下一个词', 'autoNext')}<p class="notice">全站统一使用学习判分：规范拼写、明确格式容差及训练豁免均计对；严格正确率仅供答卷辅助对照。</p></div><div class="hint-box">${icon('keyboard', 15)} Enter 提交 / 下一词　·　Ctrl + Enter 跳过　·　Tab 重听　·　Alt + ← / → 换词　·　Esc 停止播放</div>`;
   }
-  function settingsPage() { return heading('学习设置', '调成舒服的节奏，专注于每一次听写。', '<span class="badge">' + icon('check', 13) + ' 自动保存</span>') + settingsForm() + `<h3 class="settings-section">数据与备份</h3><div class="settings-panel panel"><div class="setting-row"><div><h3>学习记录保存在当前浏览器</h3><p>导出备份可在其他浏览器中恢复。</p></div><div class="option-group">${button(icon('download', 14) + ' 备份 JSON', 'backup')}${button('导出 CSV', 'backup-csv')}${button(icon('upload', 14) + ' 恢复备份', 'restore')}</div></div><div class="setting-row"><div><h3>导入项目已有错词</h3><p>仅导入实际错词，不推算历史正确率；重复导入不会重复计数。</p></div>${button('导入错词', 'legacy')}</div></div>`; }
+  function settingsPage() { return heading('学习设置', '调成舒服的节奏，专注于每一次听写。', '<span class="badge">' + icon('check', 13) + ' 自动保存</span>') + settingsForm() + `<h3 class="settings-section">数据与备份</h3><div class="settings-panel panel"><div class="setting-row"><div><h3>学习记录保存在当前浏览器</h3><p>导出备份可在其他浏览器中恢复。</p></div><div class="option-group">${button(icon('download', 14) + ' 备份 JSON', 'backup')}${button('导出 CSV', 'backup-csv')}${button(icon('upload', 14) + ' 恢复备份', 'restore')}</div></div><div class="setting-row"><div><h3>重新扫描项目旧错词</h3><p>显式重新扫描原始旧输入，补充同音混淆；稳定来源去重，重复扫描不会增加次数。</p></div>${button('导入错词', 'legacy')}</div></div>`; }
   function modal(title, description, body, wide = false) {
     const previousFocus = document.activeElement;
     if (!$('#modal-root').firstElementChild) modalReturnFocus = previousFocus;
@@ -3578,7 +3701,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function openSetup(sid, items) {
     if (route === 'practice' && !persistDraft()) return;
     const draft = read('draft', null);
-    if (validDraft(draft) && !records.some(r => r.id === draft.id)) {
+    if (validDraft(draft) && !C.completedDraftMirror(draft,records)) {
       modal('还有一份未完成的练习', '继续上次的听写，或保留完整草稿后新建；不会批改，也不会生成成绩或错词。保存的草稿可在单词本中随时继续。', `<div class="hint-box">${esc(titleOf(draft.sid))} · 已作答 ${completedCount(draft)} / ${draft.items.length} 词</div><div class="modal-footer">${button('继续上次练习', 'resume', '', 'primary')}${button('保留草稿并新建', 'save-draft-start', `data-sid="${sid}"`)}</div>`);
       setup = { sid, customItems: items }; return;
     }
@@ -3604,18 +3727,18 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const items = F.practiceItems(C, D, options);
     if (!items.length) return toast('当前没有可练习的词条。');
     if (!retainDraft(read('draft', null))) return;
-    session = { id: 'r' + Date.now(), sid: options.sid, mode: options.mode, order: options.order, items, inputs: items.map(() => ''), states: items.map(() => ''), idx: 0, started: false, elapsed: 0, filter: 'all', marked: [] };
+    session = { id: 'r'+newIdentity(), sid: options.sid, mode: options.mode, order: options.order, items, inputs: items.map(() => ''), states: items.map(() => ''), idx: 0, started: false, elapsed: 0, filter: 'all', marked: [] };
     if (session.mode === 'dictation') save('draft', session);
     game = null; closeModal(); location.hash = 'practice'; if (route === 'practice') render();
   }
-  function validDraft(value) { return value?.mode === 'dictation' && typeof value.id === 'string' && Array.isArray(value.items) && value.items.length > 0 && value.items.every(item => item && typeof item.w === 'string' && typeof item.sid === 'string' && Number.isInteger(item.index)) && Array.isArray(value.inputs); }
+  const validDraft=C.validDraft;
   function savedDrafts() { const values = read('drafts', []); return Array.isArray(values) ? values.filter(validDraft) : []; }
   function captureAnswers() {
     if (route !== 'practice' || session?.mode !== 'dictation' || !session.started) return;
     document.querySelectorAll('[data-answer]').forEach(input => {
       const i = Number(input.dataset.answer);
       if (!Number.isInteger(i) || !session.items[i] || typeof input.value !== 'string' || session.inputs[i] === input.value) return;
-      session.inputs[i] = input.value; session.states[i] = '';
+      session.inputs[i] = input.value; session.states[i] = ''; if(session.immediate)session.immediate[i]=null;
       session.explicitSkips = (session.explicitSkips || []).filter(index => index !== i);
       session.timedOut = (session.timedOut || []).filter(index => index !== i);
     });
@@ -3626,18 +3749,18 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return save('draft', session);
   }
   function retainDraft(draft) {
-    if (!validDraft(draft)) return true;
+    if (!validDraft(draft)||C.completedDraftMirror(draft,records)) return true;
     const retained = savedDrafts(), at = retained.findIndex(value => value.id === draft.id);
     if (at < 0) retained.push(draft); else retained[at] = draft;
     return save('drafts', retained);
   }
   function restoredDraft(draft) {
-    return { ...draft, timedOut: Array.isArray(draft.timedOut) ? draft.timedOut.filter(i => Number.isInteger(i) && i >= 0 && i < draft.items.length && ['timeout', 'correct', 'incorrect'].includes(draft.states?.[i])) : [], inputs: draft.items.map((_, i) => typeof draft.inputs[i] === 'string' ? draft.inputs[i] : ''), states: draft.items.map((_, i) => draft.states?.[i] || ''), explicitSkips: Array.isArray(draft.explicitSkips) ? draft.explicitSkips.filter(i => Number.isInteger(i) && i >= 0 && i < draft.items.length && draft.states?.[i] === 'skip') : [], idx: Math.max(0, Math.min(draft.items.length - 1, Number.isInteger(draft.idx) ? draft.idx : 0)), started: false, filter: 'all', marked: Array.isArray(draft.marked) ? draft.marked.slice() : [], elapsed: Number.isFinite(draft.elapsed) ? draft.elapsed : 0 };
+    return { ...draft, immediate:Array.isArray(draft.immediate)?draft.immediate.slice():[], timedOut: Array.isArray(draft.timedOut) ? draft.timedOut.filter(i => Number.isInteger(i) && i >= 0 && i < draft.items.length && ['timeout', 'correct', 'incorrect'].includes(draft.states?.[i])) : [], inputs: draft.items.map((_, i) => typeof draft.inputs[i] === 'string' ? draft.inputs[i] : ''), states: draft.items.map((_, i) => draft.states?.[i] || ''), explicitSkips: Array.isArray(draft.explicitSkips) ? draft.explicitSkips.filter(i => Number.isInteger(i) && i >= 0 && i < draft.items.length && draft.states?.[i] === 'skip') : [], idx: Math.max(0, Math.min(draft.items.length - 1, Number.isInteger(draft.idx) ? draft.idx : 0)), started: false, filter: 'all', marked: Array.isArray(draft.marked) ? draft.marked.slice() : [], elapsed: Number.isFinite(draft.elapsed) ? draft.elapsed : 0 };
   }
   function resume(id) {
     if (route === 'practice' && !persistDraft()) return;
     const active = read('draft', null), draft = id ? allDrafts().find(value => value.id === id) : active;
-    if (!validDraft(draft)) return toast('没有未完成的练习。');
+    if (!validDraft(draft)||C.completedDraftMirror(draft,records)) return toast('没有未完成的练习。');
     if (active?.id !== draft.id && !retainDraft(active)) return;
     const restored = restoredDraft(draft);
     if (!save('draft', restored)) return;
@@ -3645,10 +3768,9 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     session = restored; closeModal(); navigate('practice', false);
   }
   function allDrafts() {
-    const completedIds = new Set(records.map(record => record.id));
-    const drafts = new Map(savedDrafts().filter(d => !completedIds.has(d.id)).map(d => [d.id, d]));
+    const drafts = new Map(savedDrafts().filter(d => !C.completedDraftMirror(d,records)).map(d => [d.id, d]));
     const active = read('draft', null);
-    if (!validDraft(active) || completedIds.has(active.id)) return [...drafts.values()].reverse();
+    if (!validDraft(active) || C.completedDraftMirror(active,records)) return [...drafts.values()].reverse();
     drafts.delete(active.id);
     return [active, ...[...drafts.values()].reverse()];
   }
@@ -3798,11 +3920,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
   function refreshPractice(focus = false) {
     if (route !== 'practice' || !session) return;
     captureAnswers();
-    const gradingKey = `${settings.ignoreCase}:${C.ruleSignature(RULES)}`;
-    if (feedbackSession !== session || feedbackGrading !== gradingKey) {
-      session.states = session.states.map((state, index) => ['correct', 'incorrect'].includes(state) ? (C.scoreGrade(session.inputs[index], session.items[index].w, settings, RULES).correct ? 'correct' : 'incorrect') : state);
-      feedbackSession = session; feedbackGrading = gradingKey;
-    }
+    // Submitted feedback is a fact. Settings and current analysis never regrade it.
     const scroll = window.scrollY, active = document.activeElement;
     const answer = active?.dataset.answer, selection = answer !== undefined ? [active.selectionStart, active.selectionEnd, active.selectionDirection || 'none'] : null;
     $('#app').innerHTML = practice(); decorateAudioControls(); syncPracticeStatus(); document.body.classList.toggle('playing', playing);
@@ -3832,6 +3950,8 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if (!skip && !deadline && blank) { toast('先输入单词，或按 Ctrl + Enter 跳过。'); return; }
     stopAudio();
     const grading = C.scoreGrade(session.inputs[i], session.items[i].w, settings, RULES);
+    if(!Array.isArray(session.immediate))session.immediate=[];
+    session.immediate[i]={input:session.inputs[i],answer:session.items[i].w,correct:grading.correct,strict:grading.strict,acceptedBy:grading.acceptedBy.slice(),analysisVersion:C.ANALYSIS_VERSION,rulesSignature:C.ruleSignature(RULES)};
     const explicitSkip = skip && blank;
     session.explicitSkips = (session.explicitSkips || []).filter(index => index !== i);
     session.timedOut = (session.timedOut || []).filter(index => index !== i);
@@ -3855,48 +3975,79 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const timedOut = session.inputs.filter((value, i) => !value.trim() && session.states[i] === 'timeout' && session.timedOut?.includes(i)).length;
     modal('完成这次练习？', skipped || timedOut ? `已主动跳过 ${skipped} 词、超时未答 ${timedOut} 词，批改时计入错词。` : '批改后可查看正确率，并针对错词再练一次。', `<div class="hint-box">${esc(titleOf(session.sid))} · ${session.items.length} 词 · 专注 ${time(session.elapsed)}</div><div class="modal-footer">${button('继续练习', 'close-modal')}${button('提交并查看结果', 'finish-confirm', '', 'primary')}</div>`);
   }
-  function recoverEvidenceWrite() {
-    const patch=read('pendingWrite',null);if(!patch)return true;
+  function refreshEvidenceState(){records=read('records',[]);wrong=read('wrong',{});}
+  function recoverEvidenceWriteUnlocked() {
+    const patch=read('pendingWrite',null);if(!patch){refreshEvidenceState();return true;}
+    const identity=patch.operationId||C.stableJSON(patch);
     try {
       const nextRecords=C.mergeRecords(read('records',[]),patch.records||[]),nextWrong=C.mutateWrong(read('wrong',{}),{type:'merge',wrong:patch.wrong||{}});
       if(patch.records?.length&&!save('records',nextRecords))return false;
       if(Object.keys(patch.wrong||{}).length&&!save('wrong',nextWrong))return false;
-      for(const [name,value]of Object.entries(patch.extras||{}))if(!save(name,value))return false;
+      const extras=C.mergeJournalExtras({drafts:read('drafts',[]),draft:read('draft',null),vocabularyTypes:read('vocabularyTypes',{}),audioCorrections:read('audioCorrections',[])},patch.extras||{});
+      for(const [name,value]of Object.entries(extras)){
+        if(!save(name,value))return false;
+        if(name==='settings')settings=sanitizeSettings(value);
+        if(name==='vocabularyTypes')vocabularyTypes=value;
+        if(name==='audioCorrections')audioCorrections=value;
+      }
+      const current=read('pendingWrite',null);if(!current||(current.operationId||C.stableJSON(current))!==identity)throw Error('另一个保存操作替换了待恢复记录');
       if(!save('pendingWrite',null))return false;
-      records=nextRecords;wrong=nextWrong;return true;
+      records=nextRecords;wrong=nextWrong;
+      return true;
     }catch(error){toast('保存变更待恢复：'+error.message);return false;}
   }
-  function writeEvidence(nextRecords,nextWrong,extras={}) {
-    if(!recoverEvidenceWrite())return false;
+  function writeEvidenceUnlocked(nextRecords,nextWrong,extras={}) {
     const additions=nextRecords.filter(record=>!records.some(old=>old.id===record.id)),changes={};
-    // Validate conflicts before durable writes. Journal contains a delta, never a second full history.
     C.mergeRecords(records,nextRecords);
     for(const [word,entry]of Object.entries(nextWrong))if(C.stableJSON(wrong[word])!==C.stableJSON(entry))Object.defineProperty(changes,word,{value:entry,enumerable:true});
-    if(!save('pendingWrite',{version:1,records:additions,wrong:changes,extras}))return false;
-    return recoverEvidenceWrite();
+    if(!additions.length&&!Object.keys(changes).length&&!Object.keys(extras).length)return true;
+    if(!save('pendingWrite',{version:2,operationId:newIdentity(),records:additions,wrong:changes,extras}))return false;
+    return recoverEvidenceWriteUnlocked();
   }
-  function commitSession(target = session) {
-    if (!canFinish(target)||!recoverEvidenceWrite()) return null;
-    const existing=records.find(record=>record.id===target.id);if(existing){
-      const raw=existing.rows.map(row=>[row.w,row.in,row.sid||existing.sid,row.index]),current=target.items.map((item,index)=>[item.w,target.inputs[index],item.sid||target.sid,item.index]);
-      if(C.stableJSON(raw)===C.stableJSON(current))return existing;
-      persistDraft();modal('上次提交已恢复','当前修改与已保存的原提交不同，草稿已保留。请选择查看原提交，或将修改另存为新练习；不会覆盖原答卷。','<div class="modal-footer">'+button('查看已恢复原提交','commit-conflict-view')+button('将当前修改另存为新练习','commit-conflict-new','','primary')+'</div>');return null;
+  async function evidenceTransaction(operation,{snapshot=false}={}) {
+    const run=()=>{
+      const recovered=recoverEvidenceWriteUnlocked();
+      if(!recovered&&!snapshot)return {ok:false};
+      refreshEvidenceState();const prepared=operation();if(!prepared)return {ok:false};
+      if(prepared.write!==false&&!writeEvidenceUnlocked(prepared.records||records,prepared.wrong||wrong,prepared.extras||{}))return {ok:false};
+      return {ok:true,value:prepared.value,recoveryPending:!recovered};
+    };
+    if(!window.navigator?.locks?.request){
+      toast('当前浏览器不支持安全保存锁，尚未保存；请保留草稿并导出备份。');
+      if(snapshot){refreshEvidenceState();return {ok:true,value:operation().value,recoveryPending:true};}return {ok:false};
     }
-    const rec=C.makeRecord(target,settings,RULES,titleOf(target.sid)),nextWrong=C.mutateWrong(wrong,{type:'record',record:rec,now:Date.now()});
-    if(!writeEvidence([...records,rec],nextWrong))return null;return rec;
+    try{return await window.navigator.locks.request(evidenceLock,run);}
+    catch(error){toast('保存尚未完成：'+error.message);if(snapshot){refreshEvidenceState();return {ok:true,value:operation().value,recoveryPending:true};}return {ok:false,error};}
   }
-  function finish() {
-    captureAnswers();
-    if (!canFinish()) { closeModal(); finishPrompt(); return; }
-    stopAudio(); result = commitSession();
-    if (!result) return;
-    const completedId = session.id;
-    save('draft', null); save('drafts', savedDrafts().filter(draft => draft.id !== completedId));
-    session = null; closeModal(); navigate('result');
+  async function evidenceView(readView){const snapshot=await evidenceTransaction(()=>({write:false,value:clone(readView())}),{snapshot:true});if(!snapshot.ok||snapshot.recoveryPending){toast('尚有未完成保存，请先导出完整 JSON 备份。');return null;}return snapshot.value;}
+  async function commitSession(target = session) {
+    if(!canFinish(target))return null;
+    const frozen=clone(target),grading=clone(settings),now=Date.now();
+    const saved=await evidenceTransaction(()=>{
+      const existing=records.find(record=>record.id===frozen.id);
+      if(existing)return {write:false,value:C.draftMatchesRecord(frozen,existing)?existing:{conflict:true}};
+      const record=C.makeRecord(frozen,grading,RULES,titleOf(frozen.sid),now);
+      return {records:[...records,record],wrong:C.mutateWrong(wrong,{type:'record',record,now}),value:record};
+    });
+    if(!saved.ok)return null;
+    if(saved.value?.conflict){modal('上次提交已恢复','当前修改与已保存的原提交不同，草稿已保留。请选择查看原提交，或将修改另存为新练习；不会覆盖原答卷。','<div class="modal-footer">'+button('查看已恢复原提交','commit-conflict-view')+button('将当前修改另存为新练习','commit-conflict-new','','primary')+'</div>');return null;}
+    return saved.value;
+  }
+  async function finish() {
+    if(finishing)return;captureAnswers();if(!canFinish()){closeModal();finishPrompt();return;}
+    finishing=true;
+    try{
+      stopAudio();const active=session,frozen=clone(session),record=await commitSession(frozen);
+      if(!record)return;result=record;
+      if(session!==active||!C.draftMatchesRecord(session,record)){
+        closeModal();toast('本次提交已保存；等待期间的修改仍保留为草稿，请另存为新练习。');return;
+      }
+      session=null;closeModal();navigate('result');
+    }finally{finishing=false;}
   }
   function filteredResultRows() {
     return (C.recordView(result,RULES)?.rows || []).map((row, index) => ({row, index}))
-      .filter(({row}) => resultFilter === 'all' || row.correct===false);
+      .filter(({row}) => resultFilter === 'all' || row.reviewRequired);
   }
   const scoringReason = row => (row.acceptedBy || []).map(reason => ({number:'单复数',homophone:'同音异形词',spelling:'规范拼写',format:'格式差异（学习计对）'}[reason])).filter(Boolean).join('、');
   function scoreLabel(row) {
@@ -3915,17 +4066,17 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     return assessment.formatIssues.length?'<small class="score-live-note">格式差异 · '+esc(assessment.formatIssues.map(v=>({whitespace:'空白规范化','hyphen-character':'等价连字符规范化',boundary,case:'大小写'}[v])).join('、'))+'</small>':'';
   }
   function resultDetails(errors) {
-    const filters = `<div class="section-top result-details-heading"><h2>本次答题详情 <span>${errors.length} 个错词</span></h2><div class="segmented" aria-label="筛选答题详情">${[['all','全部词汇',result.rows.length],['wrong','只看错词',errors.length]].map(([value,label,count]) => `<button data-act="result-filter" data-value="${value}" class="${resultFilter === value ? 'active' : ''}" aria-pressed="${resultFilter === value}">${label} <small>${count}</small></button>`).join('')}</div></div>`;
+    const filters = `<div class="section-top result-details-heading"><h2>本次答题详情 <span>${errors.length} 个待复习词条</span></h2><div class="segmented" aria-label="筛选答题详情">${[['all','全部词汇',result.rows.length],['wrong','只看待复习',errors.length]].map(([value,label,count]) => `<button data-act="result-filter" data-value="${value}" class="${resultFilter === value ? 'active' : ''}" aria-pressed="${resultFilter === value}">${label} <small>${count}</small></button>`).join('')}</div></div>`;
     if (!filteredResultRows().length) return filters + `<div class="panel">${empty('本次没有错词','这次全部正确，可以切换到全部词汇查看答卷。')}</div>`;
-    return filters + `<div class="panel table-wrap"><table class="result-details"><thead><tr><th>#</th><th>正确单词</th><th>我的输入</th><th>释义</th><th>正确率判定</th></tr></thead><tbody>${filteredResultRows().map(({row: r, index: i}) => `<tr><td>${i + 1}</td><td><strong>${esc(r.w)}</strong></td><td class="${(r.correct ?? r.loose) ? 'green' : 'red'}">${esc(r.in || '未作答')}</td><td style="white-space:normal">${esc(r.m)}</td><td class="${(r.correct ?? r.loose) ? 'green' : 'red'}">${esc(scoreLabel(r))}${formatNote(r)}</td></tr>`).join('')}</tbody></table></div>`;
+    return filters + `<div class="panel table-wrap"><table class="result-details"><thead><tr><th>#</th><th>正确单词</th><th>我的输入</th><th>释义</th><th>正确率判定</th></tr></thead><tbody>${filteredResultRows().map(({row: r, index: i}) => `<tr><td>${i + 1}</td><td><strong>${esc(r.w)}</strong></td><td class="${(r.correct ?? r.loose) ? 'green' : 'red'}">${esc(r.in || '未作答')}</td><td style="white-space:normal">${esc(r.m)}</td><td class="${(r.correct ?? r.loose) ? 'green' : 'red'}">${esc(scoreLabel(r))}<div>${reasonBadges(r)}</div>${r.reviewReasons.includes('homophone')?'<small>'+(r.correct?'学习计对；仍需巩固同音混淆':'其中同音词学习计对；整题仍有计分错误')+'</small>':''}${r.reviewPending?'<small>整题待复习，词级归属待确认</small>':''}${formatNote(r)}</td></tr>`).join('')}</tbody></table></div>`;
   }
   function resultPage() {
     if (!result) return empty('选择一次练习，查看报告', '你的每次练习都保存在学习统计中。', button('查看统计', 'route', 'data-route="statistics"', 'primary'));
     if (resultFilterId !== result.id) { resultFilter = 'all'; resultFilterId = result.id; }
     result=C.recordView(result,RULES);
     const analysisNote=`按新版学习分析 · 学习正确率 ${pct(result)}% · 严格正确率 ${result.pctStrict??'—'}%（本地答案对照） · 待确认 ${result.pending} 条 · 原判 ${result.originalScore??'—'}% 仅供辅助查看`;
-    const errors = result.rows.filter(r => r.correct===false);
-    return heading('这一次，又进步了一点。', `${esc(result.title)} · ${modeNames[result.mode] || '听写模式'} · ${new Date(result.ts).toLocaleString('zh-CN')}`, button('返回单词本', 'route', 'data-route="library"')) + `<div class="result-hero panel"><div class="result-circle"><div><b>${pct(result)}<span style="font-size:16px">%</span></b><small>本次正确率</small></div></div><h2>${result.pending ? '部分历史答案待确认。' : errors.length ? '把错词变成熟词，就是下一步。' : '全部正确，这一组掌握得很好！'}</h2><p class="muted" style="font-size:12px;margin-top:7px">${esc(analysisNote)}<br>${esc(gradingNote(result))}</p><div class="result-metrics"><div><b>${result.total}</b>练习词量</div><div><b class="green">${result.okBook}</b>学习正确单词</div><div><b class="red">${errors.length}</b>待巩固单词</div><div><b>${time(result.ms)}</b>专注时间</div></div><div class="row wrap" style="justify-content:center;margin-top:25px">${nextSectionButton()}${button('重练错词 ' + icon('arrow', 14), 'retry-wrong', errors.length ? '' : 'disabled', 'primary')}${button(icon('repeat', 14) + ' 再练一遍', 'retry')}${button(icon('download', 14) + (resultFilter === 'wrong' ? ' 导出错词' : ' 导出结果'), 'export-result')}</div></div>${resultDetails(errors)}${profileTable(true)}`;
+    const errors = result.rows.filter(r => r.reviewRequired);
+    return heading('这一次，又进步了一点。', `${esc(result.title)} · ${modeNames[result.mode] || '听写模式'} · ${new Date(result.ts).toLocaleString('zh-CN')}`, button('返回单词本', 'route', 'data-route="library"')) + `<div class="result-hero panel"><div class="result-circle"><div><b>${pct(result)}<span style="font-size:16px">%</span></b><small>本次正确率</small></div></div><h2>${result.pending ? '部分历史答案待确认。' : errors.length ? '把错词变成熟词，就是下一步。' : '全部学习计对，本次无需复习。'}</h2><p class="muted" style="font-size:12px;margin-top:7px">${esc(analysisNote)}<br>${esc(gradingNote(result))}</p><div class="result-metrics"><div><b>${result.total}</b>练习词量</div><div><b class="green">${result.okBook}</b>学习正确单词</div><div><b class="red">${errors.length}</b>待巩固单词</div><div><b>${time(result.ms)}</b>专注时间</div></div><div class="row wrap" style="justify-content:center;margin-top:25px">${nextSectionButton()}${button('重练错词 ' + icon('arrow', 14), 'retry-wrong', errors.length ? '' : 'disabled', 'primary')}${button(icon('repeat', 14) + ' 再练一遍', 'retry')}${button(icon('download', 14) + (resultFilter === 'wrong' ? ' 导出错词' : ' 导出结果'), 'export-result')}</div></div>${resultDetails(errors)}${profileTable(true)}`;
   }
   // Audio requests retain the source word index, including shuffled and mixed-chapter reviews.
   function stopAudio() { audioToken++; audio.pause(); audioCleanups.splice(0).forEach(cancel => cancel()); playing = false; document.body.classList.remove('playing'); }
@@ -4019,7 +4170,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if (a.pair === b.pair && a.side !== b.side) { game.matched.push(a.pair); session.states[a.pair] = 'correct'; game.selected = []; refreshPractice(); }
     else { game.busy = true; game.errors++; document.querySelectorAll('.game-tile.selected').forEach(e => e.classList.add('mismatch')); await new Promise(resolve => setTimeout(resolve, 650)); if (game !== activeGame || route !== 'practice') return; game.selected = []; game.busy = false; refreshPractice(); }
   }
-  function reviewItems(entries) { return F.retryItems(D, entries); }
+  function reviewItems(entries) { return F.retryItems(D, scopedReviewEntries(entries)); }
   function chooseVocabularyType(item) {
     if (!item) return;
     stopAudio();
@@ -4112,97 +4263,96 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       audioCorrections = merged; showAudioCorrections(); toast(`已读取服务中的 ${count} 条音频纠错；本机未同步待办仍保留。`);
     } catch (error) { toast(`未从服务读取成功：${error.message}。本机待办未改动。`); }
   }
-  function importLegacy() {
-    if(!recoverEvidenceWrite())return;let nextWrong=wrong,count=0;const imported=read('imported',[]).slice();
-    Object.entries(window.DICT_LEGACY_RECORDS||{}).forEach(([sid,rows])=>rows.forEach((row,rowIndex)=>{
-      if(C.scoreGrade(row.in,row.w,{...settings,looseRules:true},RULES).correct)return;
-      const id=C.stableJSON(['bundled-legacy-records',sid,rowIndex,row.w,row.in]);
-      if(imported.includes(id))return;
-      const index=D.words[sid]?.findIndex(item=>item.w===row.w),snapshot={word:row.w,sid,index:index>=0?index:undefined,hasInput:typeof row.in==='string',n:1,sourceId:id};if(snapshot.hasInput)snapshot.in=row.in;
-      const entry=C.evidenceEntry(row.w,Object.hasOwn(nextWrong,row.w)?nextWrong[row.w]:{});entry.legacySnapshots[id]=snapshot;
-      nextWrong={...nextWrong};Object.defineProperty(nextWrong,row.w,{value:entry,enumerable:true});imported.push(id);count++;
-    }));
-    if(!writeEvidence(records,nextWrong,{imported}))return;closeModal();render();toast(count?`已导入 ${count} 条原始错词证据，未创建虚构的历史成绩。`:'已有错词已导入，无需重复添加。');
+  async function importLegacy() {
+    const legacy=clone(window.DICT_LEGACY_RECORDS||{});
+    const saved=await evidenceTransaction(()=>{
+      let nextWrong=wrong,count=0;const imported=read('imported',[]).slice();
+      Object.entries(legacy).forEach(([sid,rows])=>rows.forEach((row,rowIndex)=>{
+        if(!C.scoreGrade(row.in,row.w,{...settings,looseRules:true},RULES).reviewRequired)return;
+        const id=C.stableJSON(['bundled-legacy-records',sid,rowIndex,row.w,row.in]);
+        const present=Object.values(C.evidenceEntry(row.w,Object.hasOwn(nextWrong,row.w)?nextWrong[row.w]:{}).legacySnapshots).some(snapshot=>snapshot.sourceId===id);if(present)return;
+        const index=D.words[sid]?.findIndex(item=>item.w===row.w),snapshot={word:row.w,sid,index:index>=0?index:undefined,hasInput:typeof row.in==='string',n:1,sourceId:id};if(snapshot.hasInput)snapshot.in=row.in;
+        const entry=C.evidenceEntry(row.w,Object.hasOwn(nextWrong,row.w)?nextWrong[row.w]:{});entry.legacySnapshots[id]=snapshot;
+        nextWrong={...nextWrong};Object.defineProperty(nextWrong,row.w,{value:entry,enumerable:true});if(!imported.includes(id))imported.push(id);count++;
+      }));
+      return {wrong:nextWrong,extras:{imported},value:count};
+    });
+    if(!saved.ok)return;closeModal();render();toast(saved.value?`已导入 ${saved.value} 条原始错词证据，未创建虚构的历史成绩。`:'已有错词已导入，无需重复添加。');
   }
   function download(name, content, type) { const url = URL.createObjectURL(new Blob([content], { type })); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
   const csvCell = value => '"' + String(value ?? '').replace(/^[=+@-]/, "'$&").replace(/"/g, '""') + '"';
   function csvDownload(name, rows) { download(name + '.csv', '\ufeff' + rows.map(row => row.map(csvCell).join(',')).join('\r\n'), 'text/csv;charset=utf-8'); }
-  function exportRecords(rs,selectedIndices=null) {
+  const rowReviewCSV=row=>{const values=(row.assessment?.tokenObservations||[]).filter(value=>value.reviewRequired);return [row.reviewRequired?'是':'否',reasonText(row),values.length,...['homophone','spelling','omission'].map(reason=>values.filter(value=>value.reviewReasons.includes(reason)).length)];};
+  async function exportRecords(rs,selectedIndices=null) {
     if (!rs.length) return toast('完成一次练习后即可导出记录。');
-    rs=rs.map(record=>C.recordView(record,RULES));
-    csvDownload('听写记录', [['章节','模式','正确率(%)','单词','我的输入','新版学习判定','计分依据','原始即时判定','严格判定','规范判定','释义','格式说明'],
+    const ids=new Set(rs.map(record=>record.id)),snapshot=await evidenceView(()=>records.filter(record=>ids.has(record.id)));if(!snapshot)return;rs=snapshot.map(record=>C.recordView(record,RULES));
+    csvDownload('听写记录', [['章节','模式','正确率(%)','单词','我的输入','新版学习判定','计分依据','原始即时判定','严格判定','规范判定','释义','格式说明','需要复习','复习类型','词级复习次数','同音混淆次数','拼写错误次数','漏写次数'],
       ...rs.flatMap(r => r.rows.map((w,index)=>({w,index})).filter(({index})=>!selectedIndices||selectedIndices.has(index)).map(({w,index}) => [r.title, modeNames[r.mode] || r.mode, pct(r), w.w, w.in,
         w.correct===null?'待确认':w.correct ? '对' : '错', scoringReason(w),
         C.originalImmediate(r,index)===null?'待确认':C.originalImmediate(r,index)?'对':'错',
-        w.strict===null?'待确认':w.strict?'对':'错',w.loose===null?'待确认':w.loose?'对':'错',w.m,w.assessment.formatIssues.map(v=>({whitespace:'空白规范化',boundary:'词界格式差异',case:'大小写','hyphen-character':'等价连字符规范化'}[v]||v)).join('、')]))]);
+        w.strict===null?'待确认':w.strict?'对':'错',w.loose===null?'待确认':w.loose?'对':'错',w.m,w.assessment.formatIssues.map(v=>({whitespace:'空白规范化',boundary:'词界格式差异',case:'大小写','hyphen-character':'等价连字符规范化'}[v]||v)).join('、'),...rowReviewCSV(w)]))]);
   }
   function backupMenu() {
     if (route === 'practice') { captureAnswers(); stopAudio(); }
     modal('备份与恢复', '选择导出格式，保存你的学习记录。',
       `<div class="backup-options"><div><h3>JSON 完整备份</h3><p>保存成绩、错词、设置、未完成练习与反馈，可在其他浏览器恢复。</p>${button('导出 JSON','backup','','primary')}</div><div><h3>CSV 学习明细</h3><p>包含成绩、未完成答案和错词，适合用表格查看；未完成练习不计算正确率。</p>${button('导出 CSV','backup-csv')}</div></div><div class="modal-footer">${button('恢复 JSON 备份','restore')}${button('保存说明','storage-help','','text-btn')}</div>`);
   }
-  function backupData() {
-    captureAnswers(); persistDraft();
-    const draft = validDraft(session) ? session : read('draft', null);
-    const intent=read('pendingWrite',null),backupRecords=intent?C.mergeRecords(records,intent.records||[]):records,backupWrong=intent?C.mutateWrong(wrong,{type:'merge',wrong:intent.wrong||{}}):wrong;
-    return { version: 5, records:backupRecords, wrong:backupWrong, settings, vocabularyTypes, audioCorrections,
-      paper: read('paper',null), draft, drafts: savedDrafts().filter(d => d.id !== draft?.id) };
+  async function backupData() {
+    captureAnswers();const active=validDraft(session)?clone(session):null;
+    const snapshot=await evidenceTransaction(()=>{const diskDraft=read('draft',null);return {write:false,value:{version:5,records:read('records',[]),wrong:read('wrong',{}),settings:read('settings',settings),vocabularyTypes:read('vocabularyTypes',{}),audioCorrections:read('audioCorrections',[]),paper:read('paper',null),draft:active||diskDraft,drafts:savedDrafts(),observedDraft:active?diskDraft:null,pendingWrite:read('pendingWrite',null)}};},{snapshot:true});
+    if(!snapshot.ok)return null;
+    try{
+      const backup=C.materializeBackup(snapshot.value);
+      if(C.completedDraftMirror(backup.draft,backup.records))backup.draft=null;
+      backup.drafts=C.mergeDrafts(backup.drafts.filter(draft=>!C.completedDraftMirror(draft,backup.records)),backup.draft,backup.observedDraft&&!C.completedDraftMirror(backup.observedDraft,backup.records)?[backup.observedDraft]:[]).filter(draft=>!C.completedDraftMirror(draft,backup.records)&&!(draft.id===backup.draft?.id&&C.stableJSON(draft)===C.stableJSON(backup.draft)));
+      delete backup.observedDraft;
+      if(snapshot.recoveryPending)toast('已保全待恢复操作；当前保存尚未完成，请保留此 JSON 备份。');
+      return backup;
+    }catch(error){toast('待恢复记录存在冲突，已保全原始紧急包；需检查冲突后恢复。');return {...snapshot.value,recoveryRequired:true,recoveryError:error.message};}
   }
-  function exportBackupCSV() {
-    const data = backupData(), drafts = new Map(data.drafts.map(d => [d.id, d]));
+  async function exportBackupCSV() {
+    const data = await backupData();if(!data)return;if(data.recoveryRequired)return toast('存在待核实的恢复冲突，请导出完整 JSON 紧急包。');const drafts = new Map(data.drafts.map(d => [d.id, d]));
     if (validDraft(data.draft)) drafts.set(data.draft.id, data.draft);
-    const rows = [['记录ID','状态','章节','模式','正确率(%)','原词表序号','单词','我的输入','当前判定','严格判定','规范判定','释义','错误次数','掌握状态','计分依据','原始即时判定']];
+    const rows = [['记录ID','状态','章节','模式','正确率(%)','原词表序号','单词','我的输入','当前判定','严格判定','规范判定','释义','原题计错次数','掌握状态','计分依据','原始即时判定','需要复习','复习类型','词级复习次数','同音混淆次数','拼写错误次数','漏写次数']];
     for (const record of C.historyViews(data.records,RULES)) for (const [rowIndex,word]of record.rows.entries()) rows.push([
       record.id, record.mode === 'legacy' ? '旧版错词' : '已完成', titleOf(word.sid || record.sid),
       modeNames[record.mode] || record.mode,
       record.mode === 'legacy' ? '' : pct(record), Number.isInteger(word.index) ? word.index+1 : '',
       word.w, word.in, word.correct===null?'待确认':word.correct ? '对' : '错',
-      word.strict===null?'待确认':word.strict?'对':'错',word.loose===null?'待确认':word.loose?'对':'错', word.m,'','',scoringReason(word),C.originalImmediate(record,rowIndex)===null?'待确认':C.originalImmediate(record,rowIndex)?'对':'错'
+      word.strict===null?'待确认':word.strict?'对':'错',word.loose===null?'待确认':word.loose?'对':'错', word.m,'','',scoringReason(word),C.originalImmediate(record,rowIndex)===null?'待确认':C.originalImmediate(record,rowIndex)?'对':'错',...rowReviewCSV(word)
     ]);
     for (const draft of drafts.values()) draft.items.forEach((item,i) => rows.push([
       draft.id, '未完成', titleOf(item.sid), draft.order === 'shuffle' ? '乱序听写' : '听写模式', '',
       item.index+1, item.w, draft.inputs[i] || '',
       draft.explicitSkips?.includes(i) && draft.states?.[i] === 'skip' ? '主动跳过' :
       draft.timedOut?.includes(i) && draft.states?.[i] === 'timeout' ? '超时未答' :
-      String(draft.inputs[i] || '').trim() ? '待批改' : '未作答', '', '', item.m, '', '', '', ''
+      String(draft.inputs[i] || '').trim() ? '待批改' : '未作答', '', '', item.m, '', '', '', '', '', '', '', '', '', ''
     ]));
     for (const [word,value] of Object.entries(C.deriveWrong(data.records,data.wrong,RULES))) rows.push([
       '', '错词本', titleOf(value.sid), '',
       '', Number.isInteger(value.index) ? value.index+1 : '', word, value.in, '', '', '', '', value.n,
-      value.pending?'待确认':value.mastered?'已掌握':value.manual?'手动标记':'待复习',value.legacyCount?'旧累计 '+value.legacyCount+' 次待确认':'',''
+      value.pending?'待确认':value.mastered?'已掌握':value.manual?'手动标记':'待复习',value.legacyCount?'旧累计 '+value.legacyCount+' 次待确认':'','',value.reviewRequired||value.manual?'是':'否',reasonText(value),value.reviewCount,value.homophoneCount,value.spellingCount,value.omissionCount
     ]);
     csvDownload('听写室学习备份', rows);
   }
-  function mergeDraftBackup(parsed) {
-    const retained = savedDrafts(), active = read('draft', null);
-    const known = new Map([...retained, ...(validDraft(active) ? [active] : [])].map(value => [value.id, value]));
-    // A suffix is not provenance: old ambiguous IDs remain distinct. Only an
-    // explicit source ID can link a renamed import to its original draft.
-    const sourceId = value => typeof value.importSourceId==='string'&&value.importSourceId ? value.importSourceId : value.id;
-    const signature = value => { const {id,importSourceId,...content}=value;return C.stableJSON(content); };
-    for (const value of [parsed.draft, ...(Array.isArray(parsed.drafts) ? parsed.drafts : [])].filter(validDraft)) {
-      const origin=sourceId(value),content=signature(value);
-      if ([...known.values()].some(existing=>sourceId(existing)===origin&&signature(existing)===content)) continue;
-      let id = value.id, suffix = 1;
-      while (known.has(id)) id = `${value.id}-import-${suffix++}`;
-      const copy = { ...value, id, ...(id!==value.id?{importSourceId:origin}:{}) }; retained.push(copy); known.set(id, copy);
-    }
-    return retained;
-  }
+  function mergeDraftBackup(parsed){return C.mergeDrafts(savedDrafts(),read('draft',null),[parsed.draft,...(Array.isArray(parsed.drafts)?parsed.drafts:[])]);}
   function restore() {
     const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,application/json';
     input.onchange = async () => {
       try {
         const parsed = JSON.parse(await input.files[0].text());
+        if(parsed.recoveryRequired)throw Error('recovery-required');
         if (!Array.isArray(parsed.records) || !parsed.wrong || typeof parsed.wrong !== 'object' || Array.isArray(parsed.wrong) || parsed.records.some(r => typeof r.id !== 'string' || typeof r.sid !== 'string' || !Array.isArray(r.rows) || !Number.isFinite(r.ts) || !Number.isFinite(r.ms) || r.rows.some(w => !w||typeof w.w !== 'string' || (w.in!==undefined&&typeof w.in !== 'string'))) || Object.values(parsed.wrong).some(w => !C.validWrongEntry(w))) throw new Error('invalid');
-        if(!recoverEvidenceWrite())return;
-        const nextRecords=C.mergeRecords(records,parsed.records),nextWrong=C.mutateWrong(wrong,{type:'merge',wrong:parsed.wrong});
-        const features=F.mergeFeatureBackup(D,vocabularyTypes,audioCorrections,parsed),nextSettings=parsed.settings?sanitizeSettings(parsed.settings):settings;
-        const extras={drafts:mergeDraftBackup(parsed),settings:nextSettings,vocabularyTypes:features.vocabularyTypes,audioCorrections:features.audioCorrections};
-        if(parsed.paper?.items?.length&&!read('paper',null))extras.paper=parsed.paper;
-        if(!writeEvidence(nextRecords,nextWrong,extras))return;
-        settings=nextSettings;vocabularyTypes=features.vocabularyTypes;audioCorrections=features.audioCorrections;render();toast('备份已合并恢复，现有记录、原始证据与掌握状态已保留。');
-      } catch(error) { toast(error.message?.startsWith('record-id-conflict')?'备份存在同 ID 不同原答卷，整次恢复已拒绝。':'无法读取这个备份，请选择听写室导出的 JSON 文件。'); }
+        const saved=await evidenceTransaction(()=>{
+          const nextRecords=C.mergeRecords(records,parsed.records),nextWrong=C.mutateWrong(wrong,{type:'merge',wrong:parsed.wrong});
+          const features=F.mergeFeatureBackup(D,read('vocabularyTypes',{}),read('audioCorrections',[]),parsed),nextSettings=parsed.settings?sanitizeSettings(parsed.settings):sanitizeSettings(read('settings',settings));
+          const extras={drafts:mergeDraftBackup(parsed),settings:nextSettings,vocabularyTypes:features.vocabularyTypes,audioCorrections:features.audioCorrections};
+          if(parsed.paper?.items?.length&&!read('paper',null))extras.paper=parsed.paper;
+          return {records:nextRecords,wrong:nextWrong,extras,value:{features,nextSettings}};
+        });
+        if(!saved.ok){if(saved.error?.message?.startsWith('record-id-conflict'))toast('备份存在同 ID 不同原答卷，整次恢复已拒绝。');return;}
+        settings=saved.value.nextSettings;vocabularyTypes=saved.value.features.vocabularyTypes;audioCorrections=saved.value.features.audioCorrections;render();toast('备份已合并恢复，现有记录、原始证据与掌握状态已保留。');
+      } catch(error) { toast(error.message==='recovery-required'?'这是包含原始冲突的紧急备份，尚未写入；请先检查待恢复操作。':error.message?.startsWith('record-id-conflict')?'备份存在同 ID 不同原答卷，整次恢复已拒绝。':'无法读取这个备份，请选择听写室导出的 JSON 文件。'); }
     }; input.click();
   }
   function sanitizeSettings(value) {
@@ -4216,20 +4366,21 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     const clean = { ...defaults };
     Object.keys(defaults).forEach(k => { if (typeof defaults[k] === 'boolean' && typeof value[k] === 'boolean') clean[k] = value[k]; });
     for (const [k, choices] of Object.entries({ rate: [0.8, 1, 1.2, 1.4, 1.6, 2], interval: [1, 2, 3, 4, 5], repeat: [0, 1, 2, 3, 5], submit: ['manual', 'auto'], preset: [...Object.keys(presets), '自定义'] })) if (choices.includes(value[k])) clean[k] = value[k];
+    clean.ignoreCase=true;
     return clean;
   }
-  function render() {
+  function render(passive=false) {
     const previousRoute=route;
     route = location.hash.slice(1) || 'library';
     if (!routes[route] && !['practice', 'paper', 'result'].includes(route)) route = 'library';
     if(previousRoute==='paper'&&route!=='paper')paper.stop();
-    if (route !== 'practice') { clearInterval(tickTimer); if(route!=='paper'){if(paper.state)paper.stop();else stopAudio();} }
+    if (!passive && route !== 'practice') { clearInterval(tickTimer); if(route!=='paper'){if(paper.state)paper.stop();else stopAudio();} }
     $('#app').innerHTML = route === 'practice' ? practice() : route === 'paper' ? shell(paperPage()) : shell(route === 'library' ? library() : route === 'wrong' ? wrongPage() : route === 'statistics' ? statistics() : route === 'settings' ? settingsPage() : route === 'feedback' ? feedbackPage() : resultPage());
     decorateAudioControls();
     observePracticeLayout();
     if (route === 'practice' && session?.started) startTimer();
     document.title = `${routes[route] || (route === 'practice' ? modeNames[session?.mode] || '听写练习' : '练习报告')} · 听写室`;
-    if(route==='paper'&&paperStartPending){paperStartPending=false;paper.replay();}
+    if(!passive&&route==='paper'&&paperStartPending){paperStartPending=false;paper.replay();}
   }
   document.addEventListener('click', async event => {
     if (event.target.classList.contains('modal-backdrop')) { closeModal(); return; }
@@ -4239,7 +4390,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       case 'word-profile':showWordProfile(d.word);break;
       case 'profiles-more':profileLimit+=100;render();break;
       case 'answers-txt':answerExportSetup();break;
-      case 'export-answers':exportAnswers(d.type);break;
+      case 'export-answers':await exportAnswers(d.type);break;
       case 'paper-setup': paperSetup(); break;
       case 'paper-option': paperOptions[d.key]=['shuffle','dedupe'].includes(d.key)?d.value==='true':d.value;paperSetup();break;
       case 'paper-start': startPaper();break;
@@ -4251,7 +4402,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       case 'open-feedback': startFeedback(route === 'practice' ? session?.items[session.idx] : null); break;
       case 'storage-help': storageHelp(); break;
       case 'backup-menu': backupMenu(); break;
-      case 'backup-csv': exportBackupCSV(); break;
+      case 'backup-csv': await exportBackupCSV(); break;
       case 'delete-draft': confirmDeleteDraft(d.id); break;
       case 'delete-draft-confirm': deleteDraft(d.id); break;
       case 'activity-day': showActivityDay(d.day); break;
@@ -4307,8 +4458,8 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       case 'submit': submit(); break;
       case 'finish': finishPrompt(); break;
       case 'commit-conflict-view': {if(!session||!persistDraft())break;result=records.find(record=>record.id===session.id)||null;if(!result)break;session=null;closeModal();navigate('result',false);break;}
-      case 'commit-conflict-new': {if(!session)break;session.id=session.id+'-revision-'+Date.now()+'-'+Math.random().toString(36).slice(2,8);if(!persistDraft())break;closeModal();refreshPractice(true);finishPrompt();break;}
-      case 'finish-confirm': finish(); break;
+      case 'commit-conflict-new': {if(!session)break;session.id='r'+newIdentity();if(!persistDraft())break;closeModal();refreshPractice(true);finishPrompt();break;}
+      case 'finish-confirm': await finish(); break;
       case 'layout': persistDraft(); settings.immerse = d.value === 'immerse'; save('settings', settings); refreshPractice(true); break;
       case 'practice-filter': { if (!session) break; const hasWrong = session.items.some(w => currentWrong()[w.w] && !currentWrong()[w.w].mastered&&!currentWrong()[w.w].pending); if (d.value === 'wrong' && !hasWrong) { toast('这一组还没有历史错词。'); break; } captureAnswers(); stopAudio(); session.filter = d.value; const indices = visibleIndices(); if (!indices.includes(session.idx)) session.idx = indices[0]; persistDraft(); refreshPractice(true); break; }
       case 'practice-settings': stopAudio(); modal('学习设置', '调整后自动保存，继续练习即可生效。', settingsForm(), true); break;
@@ -4322,25 +4473,25 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
       case 'wrong-filter': if (['pending','uncertain','mastered','frequency'].includes(d.value)) { wrongFilter = d.value; render(); } break;
       case 'frequency-sources': showFrequencySources(d.word); break;
       case 'review-frequency': reviewFrequency(d.word); break;
-      case 'export-frequency': exportFrequency(); break;
-      case 'master': {if(!recoverEvidenceWrite())break;const next=C.mutateWrong(wrong,{type:'master',word:d.word,value:!currentWrong()[d.word]?.mastered,now:Date.now(),actionId:'master:'+Date.now()+':'+Math.random()});if(!writeEvidence(records,next))break;render();toast(currentWrong()[d.word]?.pending?'掌握标记已保存；证据仍待确认。':next[d.word].mastered?'已标记掌握，可在「已掌握」中移回。':'已移回待复习。');break;}
+      case 'export-frequency': await exportFrequency(); break;
+      case 'master': {const word=d.word,value=d.value===undefined?!currentWrong()[word]?.mastered:d.value==='true',now=Date.now(),actionId='master:'+newIdentity();const saved=await evidenceTransaction(()=>({wrong:C.mutateWrong(wrong,{type:'master',word,value,now,actionId})}));if(!saved.ok)break;render();toast(currentWrong()[word]?.pending?'掌握标记已保存；证据仍待确认。':value?'已标记掌握，可在「已掌握」中移回。':'已移回待复习。');break;}
       case 'review-all': { if (wrongFilter === 'frequency') { reviewFrequency(); break; } const items = filteredReviewItems(); if (!items.length) return toast('当前筛选下没有待复习的单词。'); openSetup(wrongChapter === 'all' ? 'review' : wrongChapter, items); break; }
       case 'retry-wrong': { const items = C.retryItems(D,C.recordView(result,RULES)); openSetup(result.sid, items); break; }
       case 'retry': openSetup(result.sid, result.rows.map(r => C.itemForRow(D, r, result.sid)).filter(Boolean)); break;
       case 'speak': { const item = C.itemsFor(D, d.sid)[Number(d.index)]; if (item) speak(item, true); else toast('未找到这个词的原音。'); break; }
-      case 'save-marks': {if(!recoverEvidenceWrite())break;const items=session.marked.map(i=>session.items[i]),next=C.mutateWrong(wrong,{type:'manual',items,now:Date.now(),actionId:'manual:'+Date.now()+':'+Math.random()});if(!writeEvidence(records,next))break;const count=items.length;session=null;navigate('wrong');toast(`已保存 ${count} 个标记错词。`);break;}
+      case 'save-marks': {if(!session)break;const active=session,signature=C.stableJSON([session.items,session.marked]),items=clone(session.marked.map(i=>session.items[i])),now=Date.now(),actionId='manual:'+newIdentity(),saved=await evidenceTransaction(()=>({wrong:C.mutateWrong(wrong,{type:'manual',items,now,actionId})}));if(!saved.ok)break;if(session===active&&C.stableJSON([session.items,session.marked])===signature){session=null;navigate('wrong');}toast(`已保存 ${items.length} 个标记错词。`);break;}
       case 'game-tile': gamePick(Number(d.index)); break;
       case 'restart-game': newGame(); session.states.fill(''); refreshPractice(); break;
-      case 'legacy': importLegacy(); break;
-      case 'export-records': exportRecords(records); break;
+      case 'legacy': await importLegacy(); break;
+      case 'export-records': await exportRecords(records); break;
       case 'result-filter': if (result && ['all','wrong'].includes(d.value)) { resultFilter = d.value; render(); } break;
       case 'export-result': {
         const rows = filteredResultRows().map(item => item.row);
         if (!rows.length) { toast('当前没有词条可导出。'); break; }
-        exportRecords([result],new Set(filteredResultRows().map(item=>item.index))); break;
+        await exportRecords([result],new Set(filteredResultRows().map(item=>item.index))); break;
       }
-      case 'export-wrong': if (!filteredWrong().length) { toast('当前筛选下没有错词可导出。'); break; } csvDownload('错词本', [['单词','章节','最近输入','确定错误次数','掌握状态','旧累计次数（待确认）','另有待确认来源'], ...filteredWrong().map(([w, v]) => [w,v.sources.map(source=>source.sid).filter((sid,i,all)=>all.indexOf(sid)===i).join('、'),v.in,v.n,v.pending?'待确认':v.mastered?'已掌握':v.manual&&!v.n?'手动标记':'待复习',v.legacyCount??'',v.hasPending?'是':'否'])]); break;
-      case 'backup': download('听写室备份-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json', JSON.stringify(backupData(), null, 2), 'application/json'); break;
+      case 'export-wrong': await exportWrong();break;
+      case 'backup': {const backup=await backupData();if(backup)download(backup.recoveryRequired?'听写室-紧急恢复.json':'听写室备份.json',JSON.stringify(backup,null,2),'application/json');break;}
       case 'restore': restore(); break;
     }
   });
@@ -4353,7 +4504,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if (input.dataset.answer !== undefined && session) {
       const i = Number(input.dataset.answer); if (!Number.isInteger(i) || !session.items[i]) return;
       const hadFeedback = ['correct', 'incorrect', 'skip', 'timeout'].includes(session.states[i]);
-      session.inputs[i] = input.value; session.states[i] = ''; session.explicitSkips = (session.explicitSkips || []).filter(index => index !== i); session.timedOut = (session.timedOut || []).filter(index => index !== i); persistDraft(); syncPracticeStatus(); schedulePracticeViewport();
+      session.inputs[i] = input.value; session.states[i] = ''; if(session.immediate)session.immediate[i]=null; session.explicitSkips = (session.explicitSkips || []).filter(index => index !== i); session.timedOut = (session.timedOut || []).filter(index => index !== i); persistDraft(); syncPracticeStatus(); schedulePracticeViewport();
       if (settings.autoNext && !event.isComposing && C.scoreGrade(input.value, session.items[i].w, settings, RULES).correct) submit();
       else if (hadFeedback) {
         // Clear feedback in place so typing and IME composition keep their cursor.
@@ -4371,6 +4522,7 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     if (input.id === 'activity-range') { activityDays=Number(input.value);refreshInsights();return; }
     if (input.dataset.trendChapter) { trendFilters[input.dataset.trendChapter]=input.value;refreshInsights();return; }
     if (input.id?.startsWith('feedback-') || input.name==='feedback-type') { updateFeedback(input,true);return; }
+    if (input.id === 'wrong-reason') { wrongReason=['all','homophone','spelling','omission'].includes(input.value)?input.value:'all'; render(); }
     if (input.id === 'wrong-chapter') { wrongChapter = input.value; render(); }
     if (input.id === 'stats-chapter') { statsFilter = input.value; render(); }
     if (input.id === 'only-records') { onlyRecords = input.checked; render(); }
@@ -4412,17 +4564,19 @@ window.DICT_LEGACY_RECORDS={"C11-T1":[{"w":"vegetarian","in":"vegetarain"},{"w":
     closeModal(); render();
     if (route === 'practice' && session?.started) focusAnswer(); else window.scrollTo(0, 0);
   });
+  window.addEventListener('storage',event=>{if(initialized&&[keys.records,keys.wrong,keys.pendingWrite].includes(event.key)){refreshEvidenceState();if(route!=='practice'&&route!=='paper')render(true);}});
   window.addEventListener('pagehide', () => { persistDraft(); paper.stop(); stopAudio(); });
   window.addEventListener('beforeunload', event => { if (!persistDraft()) { event.preventDefault(); event.returnValue = ''; } });
   window.addEventListener('resize', schedulePracticeViewport);
   window.visualViewport?.addEventListener('resize', visualViewportChanged);
   window.visualViewport?.addEventListener('scroll', visualViewportChanged);
   document.addEventListener('visibilitychange', () => { if (document.hidden) { persistDraft(); paper.stop(); stopAudio(); } else if (route === 'practice' && session) refreshPractice(false); });
-  recoverEvidenceWrite();
+  await evidenceTransaction(()=>({write:false}));
   settings = sanitizeSettings(settings);
-  if (location.hash === '#practice') { const draft = read('draft', null); if (validDraft(draft)) session = restoredDraft(draft); }
+  if (location.hash === '#practice') { const draft = read('draft', null); if (validDraft(draft)&&!C.completedDraftMirror(draft,records)) session = restoredDraft(draft); }
+  if(location.hash==='#paper'){const state=F.restoredPaper(C,D,read('paper',null));if(state)paper.load(state);}
   result = records.find(r => r.id === read('result', null)) || null;
-  render();
+  initialized=true;render();
 })();
 
 </script>

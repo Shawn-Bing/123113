@@ -1,11 +1,13 @@
 'use strict';
 const {chromium}=require(process.env.PLAYWRIGHT_PATH||'playwright');
-const {pathToFileURL}=require('url'),path=require('path'),fs=require('fs'),assert=require('assert/strict');
+const {startFixtureServer}=require('./browser-fixture-server.cjs');
+const path=require('path'),fs=require('fs'),assert=require('assert/strict');
 (async()=>{
- const browser=await chromium.launch({channel:'chrome',headless:true});
- try{
+ const html=path.resolve(process.argv[2]||[path.resolve(__dirname,'../index.html'),path.resolve(__dirname,'../site/index.html')].find(fs.existsSync)),service=await startFixtureServer(html);
+ let browser;
+ try{browser=await chromium.launch({channel:'chrome',headless:true});
   const context=await browser.newContext({acceptDownloads:true}),page=await context.newPage(),errors=[];
-  page.on('pageerror',e=>errors.push(e.message));const url=pathToFileURL(path.resolve(process.argv[2]||[path.resolve(__dirname,'../index.html'),path.resolve(__dirname,'../_scratch/tmp/ielts-target-reference/index.html')].find(fs.existsSync))).href+'?preview=1#wrong';
+  page.on('pageerror',e=>errors.push(e.message));const url=service.url+'?preview=1#wrong';
   await page.goto(url);await page.locator('[data-act="paper-setup"]').waitFor();
   const seed=await page.evaluate(()=>{
    const D=window.DICT_DATA,all=Object.entries(D.words).flatMap(([sid,rows])=>rows.map((item,index)=>({...item,sid,index}))),find=w=>all.find(item=>item.w===w);
@@ -22,7 +24,7 @@ const {pathToFileURL}=require('url'),path=require('path'),fs=require('fs'),asser
    return {records,wrong,draft,raw:JSON.stringify(records),draftRaw:JSON.stringify(draft)};
   });
   await page.reload();
-  assert.equal(await page.locator('[data-wrong-count="uncertain"]').innerText(),'1');assert.equal(await page.locator('#wrong-list tr').filter({hasText:'ability'}).count(),0);
+  assert.equal(await page.locator('[data-wrong-count="uncertain"]').innerText(),'5');assert.equal(await page.locator('#wrong-list tr').filter({hasText:'ability'}).count(),0);
   await page.locator('[data-act="wrong-filter"][data-value="uncertain"]').click();assert.match(await page.locator('#wrong-list').innerText(),/ability/);assert.ok(await page.locator('[data-act="review-all"]').isDisabled());assert.match(await page.locator('#wrong-list').innerText(),/取消掌握标记（仍待确认）/);
   await page.locator('[data-act="wrong-evidence"][data-word="ability"]').click();assert.match(await page.locator('#modal-root').innerText(),/缺少原始输入/);await page.locator('[data-act="close-modal"]').click();await page.locator('[data-act="wrong-filter"][data-value="pending"]').click();
   const scores=await page.evaluate(()=>{
@@ -36,14 +38,14 @@ const {pathToFileURL}=require('url'),path=require('path'),fs=require('fs'),asser
    for(const section of DICT_DATA.sections){const part=C.forSection(view,section.id);if(part){const point=I.series(records,DICT_DATA.sections,section.chapter,section.id).find(v=>v.id===view.id);if(point.pct!==part.pct)throw Error('Trend/report mismatch '+section.id);}}
    return {version:C.ANALYSIS_VERSION,score:view.pct,wrong:C.deriveWrong(records,rawWrong,R),roundMixed:profile.shortTerm.roundMixed,historicalMixed:profile.shortTerm.mixed,latestRound:profile.shortTerm.latestRound,pending:profile.pending};
   });
-  assert.equal(unified.version,'p0-v3');assert.equal(unified.score,30);assert.ok(!unified.wrong['full-time']);assert.equal(unified.wrong.accommodation.n,1);assert.equal(unified.wrong.accommodation.legacyCount,4);assert.equal(unified.roundMixed,false);assert.equal(unified.historicalMixed,true);assert.equal(unified.latestRound,'latest-correct');assert.equal(unified.pending,2);
+  assert.equal(unified.version,await page.evaluate(()=>DictationCore.ANALYSIS_VERSION));assert.equal(unified.score,30);assert.ok(!unified.wrong['full-time']);assert.equal(unified.wrong.accommodation.n,1);assert.equal(unified.wrong.accommodation.legacyCount,4);assert.equal(unified.roundMixed,false);assert.equal(unified.historicalMixed,true);assert.equal(unified.latestRound,'latest-correct');assert.equal(unified.pending,2);
   await page.locator('[data-act="word-profile"][data-word="survey"]').click();const surveyDetail=await page.locator('#modal-root').innerText();assert.ok(surveyDetail.includes('历史正误混合'));assert.ok(!surveyDetail.includes('本轮拼写不稳定'));await page.locator('[data-act="close-modal"]').click();
   await page.evaluate(()=>location.hash='#statistics');await page.locator('[data-act="record"][data-id="old-one"]').first().click();await page.waitForFunction(()=>location.hash==='#result');assert.match(await page.locator('.result-circle b').innerText(),/30/);
   const formatRow=page.locator('table.result-details tbody tr').filter({has:page.locator('strong',{hasText:/^full-time$/})});assert.match(await formatRow.innerText(),/学习正确/);assert.match(await formatRow.innerText(),/格式差异/);assert.equal(await formatRow.locator('td.green').count(),2);
   let csvPromise=page.waitForEvent('download');await page.locator('[data-act="export-result"]').click();let csvDownload=await csvPromise,csv=fs.readFileSync(await csvDownload.path(),'utf8');assert.ok(csv.includes('"新版学习判定"'));assert.ok(csv.includes('"原始即时判定"'));assert.match(csv,/"full-time","full time","对","[^"]*","错","错"/);
   await page.locator('[data-act="result-filter"][data-value="wrong"]').click();assert.equal(await page.locator('table.result-details tbody tr').filter({hasText:'full-time'}).count(),0);
   await page.evaluate(()=>location.hash='#wrong');await page.locator('[data-act="paper-setup"]').waitFor();
-  await page.locator('[data-act="word-profile"][data-word="irrigation"]').click();let detail=await page.locator('#modal-root').innerText();assert.ok(detail.includes('本轮拼写不稳定（2对1错）'));assert.ok(detail.includes('有效出现 3 · 正确 2 · 错误 1'));assert.ok(detail.includes('数据不足'));await page.locator('[data-act="close-modal"]').click();
+  await page.locator('[data-act="word-profile"][data-word="irrigation"]').click();let detail=await page.locator('#modal-root').innerText();assert.ok(detail.includes('本轮拼写不稳定（2对1错）'));assert.ok(detail.includes('有效出现 3 · 正确 2 · 词级计错 1'));assert.ok(detail.includes('数据不足'));await page.locator('[data-act="close-modal"]').click();
   await page.locator('[data-act="word-profile"][data-word="appearance"]').click();detail=await page.locator('#modal-root').innerText();assert.ok(detail.includes('重复相同错拼（apperance × 3）'));await page.locator('[data-act="close-modal"]').click();
   await page.locator('[data-act="paper-setup"]').click();await page.locator('[data-act="paper-option"][data-value="hyphen"]').click();await page.locator('[data-act="paper-option"][data-key="dedupe"][data-value="false"]').click();await page.locator('[data-act="paper-start"]').click();await page.locator('#paper-stage').waitFor();
   const hyphenCount=await page.evaluate(()=>{const C=DictationCore,expected=DICT_DATA.sections.flatMap(s=>C.itemsFor(DICT_DATA,s.id)).filter(w=>C.normalize(w.w).includes('-')),actual=JSON.parse(localStorage.getItem('dictation_preview_dict3_paper_draft')).items;return {expected:expected.length,actual:actual.length,positions:JSON.stringify(actual.map(v=>v.sid+':'+v.index).sort())===JSON.stringify(expected.map(v=>v.sid+':'+v.index).sort())};});assert.ok(hyphenCount.expected>90);assert.equal(hyphenCount.actual,hyphenCount.expected);assert.equal(hyphenCount.positions,true);await page.keyboard.press('Escape');await page.waitForFunction(()=>location.hash==='#wrong');
@@ -79,5 +81,5 @@ const {pathToFileURL}=require('url'),path=require('path'),fs=require('fs'),asser
   const firstRaw=await online.evaluate(()=>localStorage.getItem('dictation_preview_dict2_records'));await online.locator('[data-act="retry-wrong"]').click();await online.locator('[data-act="begin"]').click();await online.locator('[data-act="start"]').click();await online.locator('[data-answer="0"]').fill('survey');await online.locator('[data-answer="0"]').press('Enter');await online.locator('[data-act="finish-confirm"]').click();await online.waitForFunction(()=>location.hash==='#result');assert.match(await online.locator('.result-circle b').innerText(),/100/);assert.deepEqual(await online.evaluate(()=>JSON.parse(localStorage.getItem('dictation_preview_dict2_records'))[0]),JSON.parse(firstRaw)[0]);result.actualPracticeSubmitRetry=true;
   await onlineContext.close();assert.deepEqual(errors,[]);
   const output=process.env.P1_RESULT||path.join(__dirname,'../_scratch/tmp/p1-browser-result.json');if(fs.existsSync(path.dirname(output)))fs.writeFileSync(output,JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));await restoreContext.close();await context.close();
- }finally{await browser.close();}
+ }finally{if(browser)await browser.close();await service.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

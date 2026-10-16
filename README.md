@@ -18,7 +18,7 @@
 
 ## 回归验证
 
-Node 24：`node --test tests/review-regression.test.cjs`。24 项断言直接读取交付
+Node 24：`node --test tests/review-regression.test.cjs`。28 项断言直接读取交付
 `index.html`，不依赖母仓源码或额外 Node 包。覆盖真实应用提交/恢复事件、
 跨章待确认与确定错误、最近错拼/CSV/TXT/队列、五条稳定旧原始行与未知累计、
 草稿双顺序重复恢复/刷新/导出再导入、来源 ID 碰撞、证据详情和混合掌握状态。
@@ -26,18 +26,24 @@ Node 24：`node --test tests/review-regression.test.cjs`。24 项断言直接读
 ## 自动 Chrome 验收
 
 `.github/workflows/node-regression.yml` 在 main push、PR 和手动触发时，
-先跑 24 项 Node 回归，再安装固定 Playwright 1.62.1 和 Google Chrome，
-运行 `node tests/review-scope-browser.cjs index.html`。7 组浏览器检查均为硬性通过条件。
+先跑 28 项 Node 回归，再安装固定 Playwright 1.62.1 和 Google Chrome，
+运行三个脚本：`tests/learning-browser.cjs`、`tests/data-integrity-browser.cjs`、
+`tests/review-scope-browser.cjs`，参数均为 `index.html`。
+学习全流程、7 组数据完整性检查和 17 组来源/交互检查均为硬性通过条件。
 使用独立 context 和 preview 数据，不访问用户已有记录。CI 保留 JSON 结果和证据截图。
 
 本地已安装 Chrome 时，可在仓库外安装 Playwright，并令 `PLAYWRIGHT_PATH`
 指向该模块目录，再执行同一浏览器命令；require('playwright') 正常可用时无需该变量。
-`tests/fixtures/` 的两段原 WAV 与发布清单逐字节校验并实际播放。
+三个脚本共用支持 HTTP Range 的测试服务；`tests/fixtures/` 的十段原 WAV
+与发布清单逐字节校验并实际播放，无需另行下载全量音频。
 这不是全部 5,570 段音频或其他浏览器的逐项验收。
-既有 `tests/data-integrity-browser.cjs` 和 `tests/learning-browser.cjs` 仍可手动运行。
+浏览器启动或断言失败均返回非零退出码，不会让 CI 错报成功。
 
 ## 证据与恢复规则
 
+- 学习正确与复习需要独立。同音混淆按现有审核映射学习计对，同时生成独立同音复习事件；
+  普通拼写错误、漏写分别计数。合法单复数、英美拼写及格式容差不因此加入复习。
+  当前学习始终忽略大小写，原始答卷输入和即时判定保留。
 - 证据详情分别列出确定错误、待核实来源、未验证旧累计；同一词存在两类证据时，
   仅有效来源参与计数与复习。章节筛选、页面、导出和练习队列使用同一来源范围。
 - 具有稳定身份的内置旧原始行逐条计数；累计声明如 n=5 不会生成五次错误。
@@ -47,3 +53,10 @@ Node 24：`node --test tests/review-regression.test.cjs`。24 项断言直接读
   带明确来源的副本，后续重复恢复不会继续增加。不删除已有草稿来消除旧重复。
 - 标记掌握不清除原证据；恢复较旧备份不覆盖较新掌握操作，新确定错误会取消掌握。
   CSV/TXT 用于查看，恢复只支持 JSON，完整备份保留原始答案与证据。
+- 本版本通过 Web Locks 协调同来源页面的证据写入；锁不可用时明确拒绝保存，允许导出备份。
+  已打开的旧版标签页需刷新后才参与新锁协议。共享活动草稿仍为最后写入者生效；
+  备份保全快照中可读取的不同草稿版本，不承诺多标签独立草稿同步。
+- 纸上默写刷新恢复位置、顺序和自评，隐藏答案且不自动播放。
+
+本次单页对应源码提交 `2a9d7d61cfafc179eb355c808f78bfb83b59bb69`；
+交付 HTML 的 SHA256 为 `f74d9bb973ccbd1a86ce3a050f247808d4ab949b36fe486f19e03f665919ebf3`。
